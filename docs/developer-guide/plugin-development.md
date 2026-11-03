@@ -154,6 +154,46 @@ if (!config) { /* 该服务不可用，降级处理 */ }
 - `builds` 是 build 兼容性声明，可以写 `nte-*` 或精确 fingerprint。当前生产 Runtime 不计算 fingerprint，加载时也不用该字段拦截插件，因此不能把它当作运行时安全检查。
 - `license` 是单个 SPDX identifier（公开分发时必填）。
 
+### 文本本地化
+
+插件的用户可见文案走 [`anomaly.localization`](../api-reference/lifecycle-and-core.md#anomalylocalization)（共用 `ui` capability），SDK 提供 C++ 封装 `anomaly::sdk::Localizer`：
+
+```cpp
+#include "anomaly/sdk/localization.hpp"
+
+anomaly::sdk::Localizer localizer;  // 未查询到服务时一律返回英文回退
+
+// on_load 里查询一次：
+localizer = anomaly::sdk::Localizer(host);
+
+const std::string title = localizer.Text("window.title", "My Plugin");
+const std::array arguments{std::string_view(std::to_string(count))};
+const std::string status =
+    localizer.Format("status.cached", "Cached {0} entries", arguments);
+```
+
+文案源是与 `manifest.json` 同级的包目录里的 `locales/<locale>.json`：
+
+```json
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "window.title": "我的插件",
+    "plugin.description": "展示当前玩家与会话诊断。",
+    "status.cached": "已缓存 {0} 条"
+  }
+}
+```
+
+- `key` 只允许 `[a-z0-9._-]`、长度 ≤255，消息不得为空。
+- 中文消息里的 `{0}`..`{7}` 占位符必须与英文回退**完全一致**，否则宿主静默回退英文；字面花括号写 `{{` 与 `}}`。
+- 宿主用 `window.title` 作管理界面的显示名、`plugin.description` 作简介，缺失时才回退到 manifest 的 `name`/`description`。所以这两个 manifest 字段写英文回退值，中文放进目录。
+- `manifest.services` 里要声明 `{"id": "anomaly.localization", "minVersion": 1}`。
+- 当前语言在进程生命周期内固定，切换语言需重启游戏；因此文案可以在产生它的位置直接取，不必推迟到绘制。
+- 仓库自带的校验脚本会一次性检查 key 覆盖、占位符掩码、残留中文字面量和 manifest 回退语言：
+  `pwsh -NoProfile -File tools/check_plugin_i18n.ps1 -Plugin <插件名>`（省略 `-Plugin` 检查全部插件）。
+
 ## 6. Capability 与授权
 
 **每个非可选 required service 必须声明对应 capability**，否则包在 DLL 映射前被拒绝。声明未知 capability，或某个 required service 没有映射 / 没有对应 capability，都会导致包不可加载。`anomaly.core` 本身不需要 capability。
@@ -256,8 +296,8 @@ manifest 中将该服务的 `minVersion` 设为 `2`。签名和语义种子仍�
 
 ```cpp
 inline constexpr AnomalySignatureFieldV2 fields[]{
-    anomaly::sdk::FieldSeed("PlayingID", 0x420, 4),
-    anomaly::sdk::FieldSeed("Paused", 0x424),
+    anomaly::sdk::FieldSeed("PlayingID", 0x438, 4),
+    anomaly::sdk::FieldSeed("Paused", 0x43C),
 };
 inline constexpr AnomalySignatureMemberV2 members[]{
     anomaly::sdk::MemberUse(0, 4, ANOMALY_SIGNATURE_MEMBER_READ_V2),
@@ -281,7 +321,10 @@ if (resolved) {
 // 失败时使用 resolved.error() 报告原因，并停用依赖该组布局的功能。
 ```
 
-框架验证对象来源、访问宽度、对齐、唯一匹配及多个提取点的一致性，整组成功后才发布和学习。
+框架验证对象来源、访问宽度、对齐、唯一匹配及多个提取点的一致性，整组字段成功后才发布和学习。
+一个函数被游戏改写、原签名与学习记录都找不到时，它在结果里是地址 0，其余字段和地址照常发布：
+给同一个字段声明第二个独立函数（如 `pause` 之外的读取点）即可让该字段在单个函数失效时仍然成立，
+需要该地址的 Hook 自己用 `resolve` 再找一次，仍失败就只跳过那一个 Hook。
 种子不是失败兜底值。完整限制、C ABI 输出所有权和错误码见
 [Interop 与内存](../api-reference/interop-and-memory.md#版本-2同时解析地址与字段布局)。
 HiFi 已接入 PlayingID、Paused、PlayerType、CurrentID、OwnedIDs；核心播放和可选专辑分组解析，

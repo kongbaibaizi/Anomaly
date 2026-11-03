@@ -13,7 +13,7 @@ struct VisualBackup {
 std::vector<VisualBackup> visual_backups;
 Clock::time_point next_visual{};
 struct View {
-    std::string status{"等待本地角色背包。"}; size_t owned{}, changed{}, processed{}, rejected{}, already{};
+    std::string status{localizer.Text("status.inventory_waiting", "Waiting for the local character inventory.")}; size_t owned{}, changed{}, processed{}, rejected{}, already{};
     bool ready{}, active{}, busy{}, restore_failed{};
 };
 std::atomic<std::shared_ptr<const View>> published;
@@ -22,7 +22,7 @@ std::atomic_bool interested{};
 std::vector<Target> owned, queue;
 std::vector<Backup> backups;
 size_t cursor{}, rejected{}, already{};
-bool enabled{}, restore_failed{};
+bool enabled{}, restore_failed{}, initial_complete{};
 uintptr_t world_pointer{}, item_class{}, ui_class{};
 AnomalyGenerationHandleV1 inventory_handle{}, ui_handle{};
 uint32_t ui_scan_index{};
@@ -268,7 +268,12 @@ bool EffectNames(const Reader& r, const AnomalyUe5ObjectsServiceV1* objects, FNa
     const auto id = r.Name(character);
     if (id.empty() || id.size() > 12 || id.find_first_not_of("0123456789") != std::string::npos) return false;
     const std::string path = "/Game/DataTable/Character/Awaken/"+id+"AwakenEffect."+id+"AwakenEffect";
-    const auto table = FindCached(r, objects, path.c_str()); uintptr_t row_type{}; RowArray entries{}; int32_t free{};
+    auto table = FindCached(r, objects, path.c_str());
+    if(!table) {
+        const auto variant="/Game/DataTable/Character/Awaken/"+id+"AwakenEffect1."+id+"AwakenEffect1";
+        table=FindCached(r,objects,variant.c_str());
+    }
+    uintptr_t row_type{}; RowArray entries{}; int32_t free{};
     if (!table || !r.IsA(table, "DataTable") || !r.Read(table+DataTableRowStruct, row_type) ||
         r.NameAt(row_type+24) != "CharacterAwakenEffectData" ||
         !Layout(r,row_type, "AwakenEffectStructList", 8, 16) || !r.Read(table+DataTableRowMap, entries) ||
@@ -301,7 +306,7 @@ bool EffectNames(const Reader& r, const AnomalyUe5ObjectsServiceV1* objects, FNa
     return false;
 }
 void Apply(const Reader& r, const AnomalyUe5ObjectsServiceV1* objects, const Target& target) {
-    if (std::any_of(backups.begin(),backups.end(),[&](const Backup& saved){return saved.target.item.id == target.item.id;})) return;
+    const auto existing=std::find_if(backups.begin(),backups.end(),[&](const Backup& saved){return saved.target.item.id == target.item.id;});
     uintptr_t item{}, effects{}; Effects before{}; int32_t level{};
     std::array<awakening_data::Name,6> names{};
     if (!Item(r,objects,target,item,effects,level,before)) {
@@ -315,11 +320,18 @@ void Apply(const Reader& r, const AnomalyUe5ObjectsServiceV1* objects, const Tar
     }
     const auto applied = awakening_data::Unlock(before,names);
     if (!applied) { ++rejected; return; }
-    const Backup saved{target,before,*applied,level}; backups.push_back(saved);
+    Backup saved{target,before,*applied,level};
+    const bool had_backup=existing!=backups.end();
+    const auto backup_index=had_backup?static_cast<size_t>(existing-backups.begin()):backups.size();
+    if(had_backup) {
+        saved.before=awakening_data::Rebase(before,existing->applied,existing->before);
+        if(level==6) saved.level=existing->level;
+        backups[backup_index]=saved;
+    } else backups.push_back(saved);
     const int32_t six = 6; Effects verified{}; int32_t verified_level{};
     if (!Write(effects,*applied) || !Write(item+ItemAwakenLevel,six) || !r.Read(effects,verified) || verified != *applied ||
         !r.Read(item+ItemAwakenLevel,verified_level) || verified_level != 6) {
-        if (RestoreOne(r,objects,saved,true)) backups.pop_back();
+        if (RestoreOne(r,objects,saved,true)) backups.erase(backups.begin()+static_cast<std::ptrdiff_t>(backup_index));
         ++rejected;
         Log("Awakening: failed local preview for "+r.Name(target.character)); return;
     }
@@ -330,10 +342,10 @@ void Publish() {
     auto data = std::make_shared<View>(); data->owned = owned.size(); data->changed = backups.size();
     data->rejected = rejected; data->already = already;
     data->processed = cursor; data->ready = !owned.empty(); data->active = enabled || !backups.empty() || !visual_backups.empty();
-    data->busy = cursor < queue.size();
+    data->busy = !initial_complete && cursor < queue.size();
     data->restore_failed = restore_failed;
     if (!result.empty()) data->status = result;
-    else if (data->ready) data->status = "已读取全部已持有角色。";
+    else if (data->ready) data->status = localizer.Text("status.inventory_ready","All owned characters were read.");
     published.store(std::move(data));
 }
 void Tick(const Reader& r, const AnomalyUe5ObjectsServiceV1* objects) {
@@ -345,7 +357,7 @@ void Tick(const Reader& r, const AnomalyUe5ObjectsServiceV1* objects) {
     int off = 2;
     if (requested.compare_exchange_strong(off,0)) {
         restore_failed = !Restore(r,objects,true);
-        result = restore_failed ? "部分角色恢复未完成，请重试。" : "已恢复全部角色原觉醒。";
+        result = restore_failed ? localizer.Text("status.restore_partial","Some characters were not fully restored; try again.") : localizer.Text("status.restore_done","All characters' original awakening was restored.");
         Publish(); return;
     }
     if (Clock::now() >= next_inventory) {
@@ -354,11 +366,13 @@ void Tick(const Reader& r, const AnomalyUe5ObjectsServiceV1* objects) {
         const auto handle = inventory ? Handle(r,objects,inventory) : AnomalyGenerationHandleV1{};
         if (inventory_handle.id && inventory_handle.id != handle.id) {
             restore_failed = !Restore(r,objects,false);
-            result = restore_failed ? "原觉醒恢复未完成。" : "角色背包已变更，已恢复原觉醒。";
+            result = restore_failed ? localizer.Text("status.restore_incomplete","Original awakening restore did not finish.") : localizer.Text("status.restore_after_inventory_change","The character inventory changed, so the original awakening was restored.");
             owned.clear(); ui_handle = {}; ui_scan_index = 0;
         }
         inventory_handle = handle;
         if (!inventory || !ReadOwned(r,objects,inventory)) { owned.clear(); Publish(); return; }
+        // Revisit late-loaded catalogs and replicated inventory changes.
+        if(enabled && cursor>=queue.size()) {queue=owned;cursor=0;rejected=already=0;}
         if (enabled) for (const auto& target : owned) {
             if (std::none_of(queue.begin(),queue.end(),[&](const Target& queued) {
                     return queued.item.id == target.item.id && queued.uid == target.uid;
@@ -371,15 +385,17 @@ void Tick(const Reader& r, const AnomalyUe5ObjectsServiceV1* objects) {
     if (const auto command = requested.exchange(0)) {
         if (command == 2) {
             restore_failed = !Restore(r,objects,true);
-            result = restore_failed ? "部分角色恢复未完成，请重试。" : "已恢复全部角色原觉醒。";
+            result = restore_failed ? localizer.Text("status.restore_partial","Some characters were not fully restored; try again.") : localizer.Text("status.restore_done","All characters' original awakening was restored.");
         }
         else if (command == 1 && !owned.empty()) {
-            enabled = true; restore_failed = false; queue = owned; cursor = rejected = already = 0; result = "正在分批预览全部已持有角色。";
+            enabled = true; initial_complete=false; restore_failed = false; queue = owned; cursor = rejected = already = 0; result = localizer.Text("status.preview_running","Previewing all owned characters in batches.");
         }
     }
     if (enabled && cursor < queue.size()) {
         Apply(r,objects,queue[cursor++]);
-        if (cursor == queue.size()) result = rejected ? "部分角色未通过校验，未修改。" : "全部角色的觉醒节点已解锁（本机预览）。";
+        if (cursor == queue.size()) {initial_complete=true;result = rejected ?
+            localizer.Text("status.preview_partial","Some characters did not pass validation and were left unchanged."):
+            localizer.Text("status.preview_done","Every character's awakening nodes are unlocked (local preview).");}
     }
     // A selected page is refreshed once; no continuous rewriting or RPCs.
     if (enabled) {
@@ -399,7 +415,7 @@ void Tick(const Reader& r, const AnomalyUe5ObjectsServiceV1* objects) {
 }
 void Reset() {
     visual_backups.clear(); next_visual = {};
-    owned.clear(); queue.clear(); backups.clear(); cached_objects.clear(); layouts.clear(); cursor = rejected = already = 0; enabled = restore_failed = false;
+    owned.clear(); queue.clear(); backups.clear(); cached_objects.clear(); layouts.clear(); cursor = rejected = already = initial_complete = 0; enabled = restore_failed = false;
     world_pointer = item_class = ui_class = 0; inventory_handle = ui_handle = {}; ui_scan_index = 0;
     next_tick = next_inventory = next_ui_scan = {}; result.clear(); interested = false; requested = 0; Publish();
     // Signature discovery belongs to plugin startup, not an interactive frame.
@@ -411,10 +427,10 @@ void Draw(const AnomalyUiServiceV1* ui) {
     const auto data = published.load(); if (!data) return;
     const auto command = requested.load();
     int checked = command ? command == 1 : data->active;
-    if (ui->checkbox && ui->checkbox(ui->user,StringView("解锁觉醒"),&checked)) requested = checked ? 1 : 2;
-    if (data->restore_failed) ui->text(ui->user,StringView("恢复未完成，请关闭开关重试。"));
-    else if (!data->ready) ui->text(ui->user,StringView("等待角色加载…"));
-    else if (data->busy) ui->text(ui->user,StringView("正在开启…"));
-    else if (data->active && data->rejected) ui->text(ui->user,StringView("部分角色未能开启。"));
+    if (ui->checkbox && ui->checkbox(ui->user,StringView(localizer.Text("option.unlock_awakening","Unlock awakening")),&checked)) requested = checked ? 1 : 2;
+    if (data->restore_failed) ui->text(ui->user,StringView(localizer.Text("status.restore_failed_retry","The restore did not finish; turn the switch off and on to retry.")));
+    else if (!data->ready) ui->text(ui->user,StringView(localizer.Text("status.character_loading","Waiting for the character to load...")));
+    else if (data->busy) ui->text(ui->user,StringView(localizer.Text("status.enabling","Enabling...")));
+    else if (data->active && data->rejected) ui->text(ui->user,StringView(localizer.Text("status.enable_partial","Some characters could not be enabled.")));
 }
 }

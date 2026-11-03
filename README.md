@@ -9,6 +9,10 @@
 qq交流群: 1037114140
 
 <p align="center">
+  <strong>简体中文</strong> · <a href="README.en.md">English</a>
+</p>
+
+<p align="center">
   <a href="docs/user-guide/README.md">用户文档</a> ·
   <a href="docs/user-guide/third-party-plugins.md">第三方插件</a> ·
   <a href="docs/developer-guide/README.md">开发者文档</a> ·
@@ -74,10 +78,11 @@ qq交流群: 1037114140
 | **NTE Vehicle（开发者模式）** | 查看、召唤和调校当前载具，支持载具目录、显示名称、速度、扭矩、车轮摩擦及非玩家载具控制 |
 | **999夜脚本** | 在999夜赤龙古堡按指定次数循环刷怪：营地刷新、双战斗点自动战斗 |
 | **NTE Damage Dashboard** | 实时统计玩家角色伤害、命中、暴击、队伍与技能分布及最近命中记录 |
+| **Summon Lab（召唤实验室）** | 按蓝图召唤实体，预设等级和出生属性，支持敌对/宠物模式、分页管理、属性查看与清理 |
 | **Custom UID** | 自定义客户端界面上显示的 UID |
 | **换肤器 Lite** | 提供角色配饰、滑翔翼、觉醒外观预览与自定义车牌 |
 | **Camera Tools** | 增加视距、调整视角 FOV 和自由相机视角，并可选按自由相机位置加载场景 |
-| **CameraBlurFix** | 取消抬头时角色身上的虚化效果 |
+| **CameraBlurFix** | 取消角色与 NPC/人群实体的镜头虚化效果 |
 | **Better Pose** | 调整角色动作速率、暂停与位移缩放，编辑关节姿态，并可导入 MMD 动作与镜头，支持播放速度、高度修正、XYZ 移动比例、分部位幅度、逐关节校准、四肢伸展/落点和手动 A/T 形骨骼校准 |
 | **HiFi Vehicle Music** | 使用本地无损曲库替换车载音乐，支持 WASAPI、DirectSound 与 ASIO |
 | **Quick Ultimate** | 按住 Alt+1/2/3/4，自动切换角色并持续发送 Q，松开后停止 |
@@ -91,7 +96,7 @@ qq交流群: 1037114140
 | **UI Buttons** | 列出可点击的游戏 UI 按钮，并可通过界面服务执行点击 |
 | **Jelly** | 让镜头内的人物、载具与动态模型持续挤压拉伸，可调强度、频率、停止间隔与自转 |
 
-开发者模式还会显示 **Teleport**、**DLL Loader** 与 **Time Accel** 等调试插件；完整包目录见
+开发者模式还会显示 **Teleport**、**DLL Loader**、**Time Accel** 与 **Memory Dump** 等调试插件；完整包目录见
 [`plugins/README.md`](plugins/README.md)。
 
 ### 🌐 第三方插件

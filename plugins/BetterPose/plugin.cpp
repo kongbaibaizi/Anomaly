@@ -38,7 +38,7 @@ using Microsoft::WRL::ComPtr;
 #include "joint_limits.hpp"
 #include "pose_document.hpp"
 #include "retarget/motion_builder.hpp"
-#include "../common/localization.hpp"
+#include "anomaly/sdk/localization.hpp"
 
 #include <atomic>
 #include <algorithm>
@@ -109,32 +109,32 @@ int ControlTrackPriority(const std::string_view name) {
   const auto has = [&lower](const std::string_view needle) {
     return lower.find(needle) != std::string::npos;
   };
-  if (has("握") || has("拳") || has("grip"))
+  if (has("握") || has("拳") || has("grip"))  // i18n-data: MMD control-track keyword, matched against VMD data
     return 100;
-  if (has("張") || has("张") || has("开手") || has("開手") ||
+  if (has("張") || has("张") || has("开手") || has("開手") ||  // i18n-data: MMD control-track keyword, matched against VMD data
       has("spread"))
     return 95;
   if (has("hand") || has("finger") || has("controller") ||
       has("control_") || has("ctrl"))
     return 70;
-  if (has("手") || has("指")) {
-    if (has("手首") || has("手先") || has("手捩") || has("手指") ||
-        has("親指") || has("人指") || has("人差指") || has("中指") ||
-        has("薬指") || has("小指"))
+  if (has("手") || has("指")) {  // i18n-data: MMD control-track keyword, matched against VMD data
+    if (has("手首") || has("手先") || has("手捩") || has("手指") ||  // i18n-data: MMD control-track keyword, matched against VMD data
+        has("親指") || has("人指") || has("人差指") || has("中指") ||  // i18n-data: MMD control-track keyword, matched against VMD data
+        has("薬指") || has("小指"))  // i18n-data: MMD control-track keyword, matched against VMD data
       return 0;
     return 45;
   }
-  if (has("腕ik") || has("arm_ik") || has("arm ik") || has("視線") ||
-      has("视线"))
+  if (has("腕ik") || has("arm_ik") || has("arm ik") || has("視線") ||  // i18n-data: MMD control-track keyword, matched against VMD data
+      has("视线"))  // i18n-data: MMD control-track keyword, matched against VMD data
     return 60;
   return 0;
 }
 
 bool IsStructuralControlTrack(const std::string_view name) {
   static constexpr std::string_view kNames[] = {
-      "腰", "肩", "足", "ひざ", "足首", "つま先", "首", "頭", "胸",
-      "腕", "ひじ", "捩", "補助", "キャンセル", "IK", "操作中心",
-      "両目", "左目", "右目"};
+      "腰", "肩", "足", "ひざ", "足首", "つま先", "首", "頭", "胸",  // i18n-data: MMD control-track keyword, matched against VMD data
+      "腕", "ひじ", "捩", "補助", "キャンセル", "IK", "操作中心",  // i18n-data: MMD control-track keyword, matched against VMD data
+      "両目", "左目", "右目"};  // i18n-data: MMD control-track keyword, matched against VMD data
   for (const auto value : kNames)
     if (name.find(value) != std::string_view::npos)
       return true;
@@ -170,10 +170,18 @@ constexpr double kExtraMeshBindCm = 1.0;
 constexpr std::size_t kMaximumMotionBytes = 256U << 20;
 constexpr std::string_view kPoseExportPath = "pose-export.json";
 constexpr std::string_view kPoseProfileDirectory = "character-pose/profiles/";
+// The host validates every write against this schema, so it has to accept exactly what
+// BuildPoseDocument emits. It did not: the document grew motion, calibration, physics and
+// per-bone name fields while the schema still listed three properties, and
+// `additionalProperties: false` turned every save into a failure. Around a fresh install
+// that was fatal -- load finds no settings, writes the defaults, the write is rejected and
+// the plugin refuses to activate ("character pose settings are invalid"). The list is left
+// open instead of transcribed, because a transposed list has drifted twice now; the field
+// types are still checked one by one in ApplyPoseDocument when the document is read back.
 constexpr std::string_view kPoseSettingsSchema = R"json(
 {
   "type": "object",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": ["bones"],
   "properties": {
     "rootOffset": {
@@ -191,13 +199,14 @@ constexpr std::string_view kPoseSettingsSchema = R"json(
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["index", "pitch", "yaw", "roll"],
         "properties": {
           "index": {"type": "integer", "minimum": 0},
           "pitch": {"type": "number", "minimum": -180.0, "maximum": 180.0},
           "yaw": {"type": "number", "minimum": -180.0, "maximum": 180.0},
-          "roll": {"type": "number", "minimum": -180.0, "maximum": 180.0}
+          "roll": {"type": "number", "minimum": -180.0, "maximum": 180.0},
+          "name": {"type": "string"}
         }
       }
     }
@@ -219,6 +228,7 @@ struct RuntimeState {
   std::uintptr_t bound_mesh{};
   std::uintptr_t character{};
   std::uintptr_t mesh{};
+  bool external_target{};
   std::uintptr_t anim_instance{};
   std::uint32_t animation_mode{};
   std::uint8_t animation_flags{};
@@ -259,6 +269,39 @@ struct RuntimeState {
   std::vector<std::uint32_t> pose_descendants{};
 };
 
+// The selected runtime target is transient: switching to a Character Studio
+// actor tears down RuntimeState for the previous mesh.  Keep the player's
+// animation stop state separately so editing an external target does not
+// resume the player's gameplay animation.
+struct PlayerFreezeState {
+  std::uintptr_t mesh{};
+  bool active{};
+  bool pause_saved{};
+  bool mode_saved{};
+  std::uint8_t original_animation_flags{};
+  std::uint8_t original_animation_mode{};
+};
+
+struct EntityPoseState {
+  std::vector<std::array<double, 3>> angles;
+  std::vector<std::array<double, 12>> base_locals;
+  std::vector<std::int32_t> bone_parents;
+  std::array<double, 3> root_offset{};
+  bool override_enabled{};
+  bool pause_saved{};
+  std::uint8_t original_animation_flags{};
+  bool animation_mode_saved{};
+  bool animation_mode_applied{};
+  std::uint8_t original_animation_mode{};
+};
+
+struct PoseTickHook {
+  AnomalyGenerationHandleV1 handle{};
+  std::uintptr_t original{};
+  std::uintptr_t target{};
+  std::vector<std::uintptr_t> meshes;
+};
+
 struct ObjectRegistry {
   std::uintptr_t items{};
   std::uint32_t count{};
@@ -267,10 +310,19 @@ struct ObjectRegistry {
   std::uint32_t num_chunks{};
 };
 
+struct PoseTarget {
+  std::uintptr_t character{};
+  std::uintptr_t mesh{};
+  std::string label;
+};
+
 struct RenderSnapshot {
   bool active{};
   std::uintptr_t character{};
   std::uintptr_t mesh{};
+  bool external_target{};
+  std::uintptr_t selected_target_mesh{};
+  std::vector<PoseTarget> pose_targets;
   std::uintptr_t anim_instance{};
   std::uint32_t animation_mode{};
   std::uint32_t bone_space_count{};
@@ -530,7 +582,7 @@ class AtomicSecondaryTuning final {
 
 struct Context final {
   const AnomalyHostApiV1 *host{};
-  anomaly::plugins::Localizer localizer;
+  anomaly::sdk::Localizer localizer;
   const AnomalyCoreServiceV1 *core{};
   const AnomalySignatureServiceV1 *signature{};
   const AnomalyUe5NamesServiceV1 *names{};
@@ -836,6 +888,11 @@ struct Context final {
   std::mutex pose_angles_mutex;
   RenderSnapshot snapshot;
   RuntimeState runtime;
+  PlayerFreezeState player_freeze;
+  // Session-local pose cache.  A mesh switch must not make the currently
+  // edited entity borrow or lose another entity's sliders before storage I/O
+  // has a chance to complete.
+  std::map<std::uintptr_t, EntityPoseState> entity_pose_states;
   AnomalyGenerationHandleV1 settings_schema{};
   std::vector<std::array<double, 3>> bone_angles;
   std::vector<std::array<double, 12>> pose_base_locals;
@@ -865,9 +922,32 @@ struct Context final {
   std::atomic<int> manual_calibration_issue{};
   std::uintptr_t automatic_calibration_mesh{};
   std::atomic_bool pose_settings_dirty{};
+  // State/config writes are forbidden from game and render callbacks.  Keep the
+  // serialized snapshot on the game thread, then perform the actual writes on a
+  // scheduler worker.
+  struct PoseSettingsSaveRequest {
+    std::string document;
+    std::string character_id;
+  };
+  std::atomic_bool pose_settings_save_queued{};
+  std::atomic_bool pose_settings_save_failed{};
+  std::atomic<std::uint64_t> pose_settings_retry_after_ms{};
   std::atomic<std::uint64_t> pose_settings_save_error_log_ms{};
   std::uintptr_t g_objects_address{};
   ObjectRegistry object_registry{};
+  // Pose targets are the local pawn plus root skeletal meshes owned by
+  // SkeletalMeshActor instances (Character Studio uses this actor type).
+  // Discovery is read-only and chunked over the UE object registry.
+  std::vector<PoseTarget> pose_targets;
+  std::vector<PoseTarget> pose_target_scan_results;
+  std::atomic<std::uintptr_t> requested_pose_target{
+      (std::numeric_limits<std::uintptr_t>::max)()};
+  std::uintptr_t selected_pose_target_mesh{};
+  std::uintptr_t local_character{};
+  std::uintptr_t local_mesh{};
+  std::atomic_bool pose_target_scan_requested{true};
+  bool pose_target_scan_running{};
+  std::uint32_t pose_target_scan_cursor{};
   std::string reflection_status{"reflection idle"};
   std::array<char, 256> pose_status{};
   std::vector<std::string> bone_names;
@@ -884,9 +964,8 @@ struct Context final {
   std::atomic_bool rate_override_enabled{};
   std::atomic_bool root_motion_override_enabled{};
   std::atomic_bool pose_override_enabled{};
-  AnomalyGenerationHandleV1 tick_hook{};
-  std::uintptr_t tick_original{};
-  std::uintptr_t tick_target{};
+  std::mutex tick_hooks_mutex;
+  std::vector<PoseTickHook> tick_hooks;
   std::atomic<std::uint32_t> reflection_action_requested{0};
   std::atomic<float> requested_rate_scale{1.0F};
   std::atomic<float> requested_root_motion_scale{1.0F};
@@ -1509,7 +1588,26 @@ std::atomic<Context *> g_active{};
 // extra mesh helpers are defined) has to drop them when the pawn changes.
 bool DropExtraMeshes(Context &context) noexcept;
 void BindRuntimeCharacter(Context &context, std::uintptr_t character,
-                          std::uintptr_t mesh) noexcept;
+                          std::uintptr_t mesh,
+                          bool external_target = false) noexcept;
+void CapturePlayerFreeze(Context &context) noexcept;
+bool ApplyPlayerFreeze(Context &context) noexcept;
+bool ReleasePlayerFreeze(Context &context) noexcept;
+void SeedPlayerFreezeRuntime(Context &context,
+                             std::uintptr_t mesh) noexcept;
+void CaptureEntityPose(Context &context, std::uintptr_t mesh) noexcept;
+bool RestoreEntityPose(Context &context, std::uintptr_t mesh) noexcept;
+void SeedEntityAnimationRuntime(Context &context,
+                                std::uintptr_t mesh) noexcept;
+bool ApplyCachedEntityPose(Context &context,
+                           std::uintptr_t mesh) noexcept;
+bool MaintainParkedEntityPose(Context &context,
+                               std::uintptr_t mesh,
+                               EntityPoseState &saved) noexcept;
+void SyncEntityAnimationState(Context &context) noexcept;
+void RestoreParkedEntityAnimations(Context &context) noexcept;
+bool ReadArrayHeader(Context &context, std::uintptr_t array_address,
+                     std::uintptr_t &data, std::uint32_t &count) noexcept;
 
 AnomalyStatusV1 Status(const std::uint32_t code,
                        const std::string_view message = {}) noexcept {
@@ -1698,15 +1796,22 @@ void ANOMALY_CALL LibraryTask(void *user, AnomalyGenerationHandleV1) noexcept {
       const bool read = StorageReadFile(context.storage, better_pose::library::kIndexPath,
                                         result.document, &missing, &code);
       result.ok = read || missing;
+      const std::string code_text = std::to_string(code);
+      const std::array<std::string_view, 1> code_arguments{code_text};
       result.status = missing ? std::string("__empty_library__")
                               : result.ok ? std::string{}
-                                          : "库索引读取失败（状态码 " + std::to_string(code) + "）";
+                                          : context.localizer.Format(
+                                                "library.error.index_read",
+                                                "Library index read failed (status {0})",
+                                                code_arguments);
     } else if (result.request.operation == 1 || result.request.operation == 3) {
       const auto kind = result.request.operation == 1 ? better_pose::library::Kind::Pose
                                                        : better_pose::library::Kind::Motion;
       if (result.request.name.empty() || entries.size() >= better_pose::library::kMaximumEntries ||
           better_pose::library::HasName(entries, kind, result.request.name)) {
-        result.status = "名称无效、重复或库已满";
+        result.status = context.localizer.Text(
+            "library.error.name_invalid",
+            "The name is invalid, duplicated, or the library is full");
       } else {
         better_pose::library::Entry entry{NewLibraryId(kind), result.request.name, kind, 1};
         const std::uint32_t entry_code = StorageWriteFile(
@@ -1715,45 +1820,78 @@ void ANOMALY_CALL LibraryTask(void *user, AnomalyGenerationHandleV1) noexcept {
           entries.push_back(entry);
           const std::uint32_t index_code = write_index();
           result.ok = index_code == ANOMALY_STATUS_V1_OK;
-          result.status = result.ok ? "已保存：" + entry.name
-                                    : "保存库索引失败（状态码 " + std::to_string(index_code) + "）";
+          const std::string name_text = entry.name;
+          const std::array<std::string_view, 1> name_arguments{name_text};
+          const std::string index_text = std::to_string(index_code);
+          const std::array<std::string_view, 1> index_arguments{index_text};
+          result.status =
+              result.ok ? context.localizer.Format("library.saved", "Saved {0}", name_arguments)
+                        : context.localizer.Format("library.error.index_write",
+                                                   "Library index write failed (status {0})",
+                                                   index_arguments);
           if (!result.ok)
             static_cast<void>(StorageRemoveFile(context.storage, better_pose::library::PathFor(entry)));
         } else {
-          result.status = "保存库文件失败（状态码 " + std::to_string(entry_code) + "）";
+          const std::string entry_text = std::to_string(entry_code);
+          const std::array<std::string_view, 1> entry_arguments{entry_text};
+          result.status = context.localizer.Format(
+              "library.error.entry_write", "Library file write failed (status {0})",
+              entry_arguments);
         }
       }
     } else {
       auto it = found();
       if (it == entries.end()) {
-        result.status = "库条目不存在";
+        result.status = context.localizer.Text(
+            "library.error.entry_missing", "Library entry not found");
       } else if (result.request.operation == 2 || result.request.operation == 4) {
         std::uint32_t code{};
         result.ok = StorageReadFile(context.storage, better_pose::library::PathFor(*it),
                                     result.document, nullptr, &code);
-        result.status = result.ok ? std::string{}
-                                  : "库条目读取失败（状态码 " + std::to_string(code) + "）";
+        const std::string code_text = std::to_string(code);
+        const std::array<std::string_view, 1> code_arguments{code_text};
+        result.status =
+            result.ok ? std::string{}
+                      : context.localizer.Format("library.error.entry_read",
+                                                 "Library entry read failed (status {0})",
+                                                 code_arguments);
       } else if (result.request.operation == 5) {
         if (result.request.name.empty() || better_pose::library::HasName(
                                                   entries, it->kind, result.request.name, it->id)) {
-          result.status = "名称为空或已存在";
+          result.status = context.localizer.Text(
+              "library.error.rename_invalid", "The name is empty or already in use");
         } else {
           it->name = result.request.name;
           const std::uint32_t code = write_index();
           result.ok = code == ANOMALY_STATUS_V1_OK;
-          result.status = result.ok ? "已重命名：" + it->name
-                                    : "重命名失败（状态码 " + std::to_string(code) + "）";
+          const std::string name_text = it->name;
+          const std::array<std::string_view, 1> name_arguments{name_text};
+          const std::string code_text = std::to_string(code);
+          const std::array<std::string_view, 1> code_arguments{code_text};
+          result.status =
+              result.ok
+                  ? context.localizer.Format("library.renamed", "Renamed to {0}", name_arguments)
+                  : context.localizer.Format("library.error.rename_failed",
+                                             "Rename failed (status {0})", code_arguments);
         }
       } else if (result.request.operation == 6) {
         const auto old_entry = *it;
         if (!StorageRemoveFile(context.storage, better_pose::library::PathFor(old_entry))) {
-          result.status = "删除库文件失败";
+          result.status = context.localizer.Text(
+              "library.error.delete_failed", "Library file delete failed");
         } else {
           entries.erase(it);
           const std::uint32_t code = write_index();
           result.ok = code == ANOMALY_STATUS_V1_OK;
-          result.status = result.ok ? "已删除：" + old_entry.name
-                                    : "保存库索引失败（状态码 " + std::to_string(code) + "）";
+          const std::string name_text = old_entry.name;
+          const std::array<std::string_view, 1> name_arguments{name_text};
+          const std::string code_text = std::to_string(code);
+          const std::array<std::string_view, 1> code_arguments{code_text};
+          result.status =
+              result.ok ? context.localizer.Format("library.deleted", "Deleted {0}", name_arguments)
+                        : context.localizer.Format("library.error.index_write",
+                                                   "Library index write failed (status {0})",
+                                                   code_arguments);
         }
       }
     }
@@ -1761,7 +1899,8 @@ void ANOMALY_CALL LibraryTask(void *user, AnomalyGenerationHandleV1) noexcept {
       result.entries = std::move(entries);
   } catch (...) {
     result.ok = false;
-    result.status = "库文件操作失败";
+    result.status = context.localizer.Text(
+        "library.error.storage", "Library file operation failed");
   }
   std::lock_guard<std::mutex> lock(context.library_io_mutex);
   context.library_io_results.push_back(std::move(result));
@@ -2915,6 +3054,63 @@ bool WriteDirectPoseProfile(const std::string &character_id,
   }
 }
 
+bool WritePoseSettingsDocument(Context &context, const std::string &document,
+                               const std::string &character_id,
+                               std::string &error) noexcept {
+  try {
+    if (!ConfigReady(context.config)) {
+      error = "config service unavailable";
+      return false;
+    }
+    if (document.size() > kMaximumPoseSettingsBytes) {
+      error = "document too large";
+      return false;
+    }
+    const auto config_status = context.config->write_atomic(
+        context.config->user, anomaly::sdk::StringView(kPoseSettingsSchemaId),
+        kPoseSettingsSchemaVersion, Bytes(document));
+    if (config_status.code != ANOMALY_STATUS_V1_OK) {
+      error = "config write code=" + std::to_string(config_status.code) +
+              " id=" + character_id;
+      return false;
+    }
+
+    // Only a known character has a per-character profile to write.  The
+    // config document above remains the authoritative global fallback.
+    bool profile_attempted = false;
+    bool profile_ok = character_id.empty();
+    AnomalyStatusV1 profile_status = anomaly::sdk::Ok();
+    std::string direct_error;
+    if (!character_id.empty() && StorageReady(context.storage)) {
+      profile_attempted = true;
+      const std::string path = PoseProfilePath(character_id);
+      profile_status = context.storage->write_atomic(
+          context.storage->user, anomaly::sdk::StringView(path), Bytes(document));
+      profile_ok = profile_status.code == ANOMALY_STATUS_V1_OK;
+    }
+    if (!profile_ok && !character_id.empty())
+      profile_ok = WriteDirectPoseProfile(character_id, document, direct_error);
+    if (!profile_ok) {
+      error = profile_attempted
+                  ? "character profile write code=" +
+                        std::to_string(profile_status.code)
+                  : "character profile storage unavailable";
+      if (!direct_error.empty())
+        error += "; direct=" + direct_error;
+      error += " id=" + character_id;
+      return false;
+    }
+    error.clear();
+    return true;
+  } catch (const std::exception &exception) {
+    error = std::string("exception: ") + exception.what();
+    return false;
+  } catch (...) {
+    error = "unknown exception";
+    return false;
+  }
+}
+
 bool PersistPoseSettings(Context &context) noexcept {
   const auto fail = [&context](const std::string &reason) {
     const std::uint64_t now = GetTickCount64();
@@ -2927,45 +3123,11 @@ bool PersistPoseSettings(Context &context) noexcept {
     }
     return false;
   };
-  if (!ConfigReady(context.config))
-    return fail("config service unavailable");
   try {
     const std::string document = BuildPoseDocument(context);
-    if (document.size() > kMaximumPoseSettingsBytes)
-      return fail("document too large");
-    const auto config_status = context.config->write_atomic(
-        context.config->user, anomaly::sdk::StringView(kPoseSettingsSchemaId),
-        kPoseSettingsSchemaVersion, Bytes(document));
-    bool profile_attempted = false;
-    bool profile_ok = false;
-    AnomalyStatusV1 profile_status = anomaly::sdk::Ok();
-    std::string direct_error;
-    if (!context.active_character_id.empty() && StorageReady(context.storage)) {
-      profile_attempted = true;
-      const std::string path = PoseProfilePath(context.active_character_id);
-      const std::string profile = BuildPoseDocument(context);
-      profile_status =
-          context.storage
-              ->write_atomic(context.storage->user,
-                             anomaly::sdk::StringView(path), Bytes(profile));
-      profile_ok = profile_status.code == ANOMALY_STATUS_V1_OK;
-    }
-    if (!profile_ok && !context.active_character_id.empty())
-      profile_ok = WriteDirectPoseProfile(context.active_character_id,
-                                          BuildPoseDocument(context),
-                                          direct_error);
-    if (!profile_ok) {
-      std::string reason = "config write code=" +
-                           std::to_string(config_status.code);
-      reason += profile_attempted
-                    ? "; character profile write code=" +
-                          std::to_string(profile_status.code)
-                    : "; storage unavailable";
-      reason += direct_error.empty() ? std::string()
-                                     : "; direct=" + direct_error;
-      reason += " id=" + context.active_character_id;
-      return fail(reason);
-    }
+    std::string error;
+    if (!WritePoseSettingsDocument(context, document, context.active_character_id, error))
+      return fail(error);
     context.pose_settings_save_error_log_ms.store(0,
                                                   std::memory_order_release);
     return true;
@@ -2973,6 +3135,92 @@ bool PersistPoseSettings(Context &context) noexcept {
     return fail(std::string("exception: ") + error.what());
   } catch (...) {
     return fail("unknown exception");
+  }
+}
+
+struct PoseSettingsTaskData {
+  Context *context{};
+  Context::PoseSettingsSaveRequest request;
+};
+
+void ANOMALY_CALL PoseSettingsTask(void *user,
+                                   AnomalyGenerationHandleV1) noexcept {
+  std::unique_ptr<PoseSettingsTaskData> task(
+      static_cast<PoseSettingsTaskData *>(user));
+  if (!task || task->context == nullptr)
+    return;
+  auto &context = *task->context;
+  std::string error;
+  const bool ok = WritePoseSettingsDocument(
+      context, task->request.document, task->request.character_id, error);
+  if (ok) {
+    context.pose_settings_save_failed.store(false, std::memory_order_release);
+    context.pose_settings_save_error_log_ms.store(0,
+                                                  std::memory_order_release);
+    context.pose_settings_retry_after_ms.store(0, std::memory_order_release);
+  } else {
+    context.pose_settings_save_failed.store(true, std::memory_order_release);
+    context.pose_settings_dirty.store(true, std::memory_order_release);
+    const std::uint64_t now = GetTickCount64();
+    context.pose_settings_retry_after_ms.store(now + 2000,
+                                               std::memory_order_release);
+    const std::uint64_t last =
+        context.pose_settings_save_error_log_ms.load(std::memory_order_acquire);
+    if (last == 0 || now - last >= 2000) {
+      context.pose_settings_save_error_log_ms.store(now,
+                                                    std::memory_order_release);
+      LogDiagnostic(context, "betterpose settings save failed: " + error);
+    }
+  }
+  context.pose_settings_save_queued.store(false, std::memory_order_release);
+}
+
+bool QueuePoseSettingsSave(Context &context) noexcept {
+  bool expected = false;
+  if (!context.pose_settings_save_queued.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel))
+    return true;
+  context.pose_settings_dirty.exchange(false, std::memory_order_acq_rel);
+  const auto fail = [&context](const std::string_view reason) {
+    context.pose_settings_save_queued.store(false, std::memory_order_release);
+    context.pose_settings_save_failed.store(true, std::memory_order_release);
+    context.pose_settings_dirty.store(true, std::memory_order_release);
+    const std::uint64_t now = GetTickCount64();
+    context.pose_settings_retry_after_ms.store(now + 2000,
+                                               std::memory_order_release);
+    const std::uint64_t last =
+        context.pose_settings_save_error_log_ms.load(std::memory_order_acquire);
+    if (last == 0 || now - last >= 2000) {
+      context.pose_settings_save_error_log_ms.store(now,
+                                                    std::memory_order_release);
+      LogDiagnostic(context, "betterpose settings save failed: " +
+                                 std::string(reason));
+    }
+    return false;
+  };
+  if (!SchedulerReady(context.scheduler))
+    return fail("scheduler service unavailable");
+  try {
+    Context::PoseSettingsSaveRequest request;
+    request.document = BuildPoseDocument(context);
+    request.character_id = context.active_character_id;
+    if (request.document.size() > kMaximumPoseSettingsBytes)
+      return fail("document too large");
+    auto *data = new (std::nothrow) PoseSettingsTaskData{
+        &context, std::move(request)};
+    if (data == nullptr)
+      return fail("save task allocation failed");
+    AnomalyGenerationHandleV1 handle{};
+    const auto status = context.scheduler->schedule(
+        context.scheduler->user, 0, PoseSettingsTask, data, &handle);
+    if (status.code != ANOMALY_STATUS_V1_OK || handle.id == 0) {
+      context.pose_settings_save_queued.store(false, std::memory_order_release);
+      delete data;
+      return fail("save task scheduling failed");
+    }
+    return true;
+  } catch (...) {
+    return fail("save task preparation failed");
   }
 }
 
@@ -3052,6 +3300,118 @@ void ResetPoseValues(Context &context) noexcept {
   context.requested_root_offset[0].store(0.0, std::memory_order_release);
   context.requested_root_offset[1].store(0.0, std::memory_order_release);
   context.requested_root_offset[2].store(0.0, std::memory_order_release);
+}
+
+void CaptureEntityPose(Context &context, const std::uintptr_t mesh) noexcept {
+  if (mesh == 0)
+    return;
+
+  try {
+    EntityPoseState captured;
+    {
+      std::lock_guard<std::mutex> lock(context.pose_angles_mutex);
+      captured.angles = context.bone_angles;
+      if (context.pose_base_ready && context.pose_base_mesh == mesh)
+        captured.base_locals = context.pose_base_locals;
+      if (captured.base_locals.empty() &&
+          context.ref_locals.size() == context.runtime.local_space_count)
+        captured.base_locals = context.ref_locals;
+    }
+    if (context.bone_parents_ready && context.bone_parents_mesh == mesh)
+      captured.bone_parents = context.bone_parents;
+    if (captured.bone_parents.empty() &&
+        context.bone_parents.size() == context.runtime.local_space_count)
+      captured.bone_parents = context.bone_parents;
+    if (context.runtime.bound_mesh == mesh) {
+      captured.pause_saved = context.runtime.saved_pause;
+      captured.original_animation_flags =
+          context.runtime.original_animation_flags;
+      captured.animation_mode_saved = context.runtime.saved_animation_mode;
+      captured.animation_mode_applied = context.runtime.animation_mode_applied;
+      captured.original_animation_mode = context.runtime.original_animation_mode;
+    }
+    for (std::size_t axis{}; axis != 3; ++axis)
+      captured.root_offset[axis] =
+          context.requested_root_offset[axis].load(std::memory_order_acquire);
+    captured.override_enabled =
+        context.pose_override_enabled.load(std::memory_order_acquire);
+    context.entity_pose_states[mesh] = std::move(captured);
+  } catch (...) {
+  }
+}
+
+bool HasCachedPoseEffect(const EntityPoseState &saved) noexcept {
+  if (!saved.override_enabled)
+    return false;
+  if (saved.base_locals.empty() ||
+      saved.bone_parents.size() != saved.base_locals.size())
+    return false;
+  if (saved.root_offset[0] != 0.0 || saved.root_offset[1] != 0.0 ||
+      saved.root_offset[2] != 0.0)
+    return true;
+  for (const auto &angle : saved.angles) {
+    if (angle[0] != 0.0 || angle[1] != 0.0 || angle[2] != 0.0)
+      return true;
+  }
+  return false;
+}
+
+bool HasCachedEntityPose(Context &context) noexcept {
+  for (const auto &entry : context.entity_pose_states) {
+    if (entry.first != context.runtime.mesh && HasCachedPoseEffect(entry.second))
+      return true;
+  }
+  return false;
+}
+
+void SeedEntityAnimationRuntime(Context &context,
+                                const std::uintptr_t mesh) noexcept {
+  const auto found = context.entity_pose_states.find(mesh);
+  if (found == context.entity_pose_states.end())
+    return;
+  RuntimeState &state = context.runtime;
+  const EntityPoseState &saved = found->second;
+  state.saved_pause = saved.pause_saved;
+  state.original_animation_flags = saved.original_animation_flags;
+  state.saved_animation_mode = saved.animation_mode_saved;
+  state.animation_mode_applied = saved.animation_mode_applied;
+  state.original_animation_mode = saved.original_animation_mode;
+}
+
+bool RestoreEntityPose(Context &context, const std::uintptr_t mesh) noexcept {
+  if (mesh == 0)
+    return false;
+  const auto found = context.entity_pose_states.find(mesh);
+  if (found == context.entity_pose_states.end())
+    return false;
+
+  try {
+    const EntityPoseState &saved = found->second;
+    {
+      std::lock_guard<std::mutex> lock(context.pose_angles_mutex);
+      context.bone_angles = saved.angles;
+      if (!saved.base_locals.empty()) {
+        context.pose_base_locals = saved.base_locals;
+        context.pose_base_mesh = mesh;
+        context.pose_base_ready = true;
+      }
+    }
+    if (!saved.bone_parents.empty()) {
+      context.bone_parents = saved.bone_parents;
+      context.bone_parents_mesh = mesh;
+      context.bone_parents_count =
+          static_cast<std::uint32_t>(saved.bone_parents.size());
+      context.bone_parents_ready = true;
+    }
+    for (std::size_t axis{}; axis != 3; ++axis)
+      context.requested_root_offset[axis].store(saved.root_offset[axis],
+                                                std::memory_order_release);
+    context.pose_override_enabled.store(saved.override_enabled,
+                                        std::memory_order_release);
+    return true;
+  } catch (...) {
+    return false;
+  }
 }
 
 better_pose::history::PoseState CapturePoseState(Context &context) {
@@ -3222,17 +3582,15 @@ bool ResolveGWorld(Context &context) noexcept {
   return true;
 }
 
-bool ResolveLocalCharacter(Context &context) noexcept {
-  context.runtime.character = 0;
-  context.runtime.mesh = 0;
-  context.runtime.anim_instance = 0;
+bool ResolvePlayerCharacterPair(Context &context, std::uintptr_t &character,
+                                std::uintptr_t &mesh) noexcept {
+  character = 0;
+  mesh = 0;
   std::uintptr_t world{};
   std::uintptr_t game_instance{};
   std::uintptr_t local_players{};
   std::uintptr_t local_player{};
   std::uintptr_t controller{};
-  std::uintptr_t character{};
-  std::uintptr_t mesh{};
   if (!Read(context, context.runtime.g_world_address, world) ||
       !ReadPointerAt(context, world, kWorldGameInstanceOffset, game_instance) ||
       !ReadPointerAt(context, game_instance, kGameInstanceLocalPlayersOffset,
@@ -3244,21 +3602,62 @@ bool ResolveLocalCharacter(Context &context) noexcept {
       !ReadPointerAt(context, character, kCharacterMeshOffset, mesh)) {
     return false;
   }
-  BindRuntimeCharacter(context, character, mesh);
+  return true;
+}
+
+bool ResolveLocalCharacter(Context &context) noexcept {
+  context.runtime.character = 0;
+  context.runtime.mesh = 0;
+  context.runtime.anim_instance = 0;
+  std::uintptr_t player_character{};
+  std::uintptr_t player_mesh{};
+  if (!ResolvePlayerCharacterPair(context, player_character, player_mesh))
+    return false;
+  context.local_character = player_character;
+  context.local_mesh = player_mesh;
+
+  std::uintptr_t character = player_character;
+  std::uintptr_t mesh = player_mesh;
+  bool external_target = false;
+  if (context.selected_pose_target_mesh != 0 &&
+      context.selected_pose_target_mesh != player_mesh) {
+    const auto found = std::find_if(
+        context.pose_targets.begin(), context.pose_targets.end(),
+        [&](const PoseTarget &target) {
+          return target.mesh == context.selected_pose_target_mesh &&
+                 target.character != 0;
+        });
+    std::uintptr_t target_data{};
+    std::uint32_t target_count{};
+    const bool target_readable =
+        found != context.pose_targets.end() &&
+        ReadArrayHeader(context,
+                        found->mesh + kMeshComponentSpaceBuffer0Offset,
+                        target_data, target_count) &&
+        target_data != 0 && target_count != 0 && target_count <= 4096;
+    if (target_readable) {
+      character = found->character;
+      mesh = found->mesh;
+      external_target = true;
+    } else {
+      context.selected_pose_target_mesh = 0;
+      context.pose_target_scan_requested.store(true, std::memory_order_release);
+    }
+  }
+  BindRuntimeCharacter(context, character, mesh, external_target);
   context.runtime.character = character;
   context.runtime.mesh = mesh;
+  context.runtime.external_target = external_target;
   if (context.extra_mesh_owner != mesh &&
       context.mesh_scan_owner != mesh &&
       !context.mesh_scan_requested.load(std::memory_order_acquire) &&
       !context.mesh_scan_running) {
-    // The extra components belong to a pawn, so switching character invalidates
-    // them; rescan once per pawn instead of asking for another scan. Cheap: it is
-    // chunked across ticks and read-only.
+    // The extra components belong to the selected actor, so switching target
+    // invalidates them; rescan once per target instead of asking every frame.
     context.mesh_scan_requested.store(true, std::memory_order_release);
   }
   return true;
 }
-
 bool ReadAnimationState(Context &context) noexcept {
   const auto mesh = context.runtime.mesh;
   if (mesh == 0)
@@ -3391,7 +3790,7 @@ bool ApplyRate(Context &context, const bool enabled, const float value) noexcept
 
 bool RestoreRootMotion(Context &context) noexcept {
   RuntimeState &state = context.runtime;
-  if (!state.saved_root_motion || state.character == 0)
+  if (!state.saved_root_motion || state.external_target || state.character == 0)
     return true;
   if (!Write(context, state.character + kCharacterAnimRootMotionScaleOffset,
              state.original_root_motion_scale))
@@ -3403,6 +3802,8 @@ bool RestoreRootMotion(Context &context) noexcept {
 bool ApplyRootMotion(Context &context, const bool enabled,
                      const float value) noexcept {
   RuntimeState &state = context.runtime;
+  if (state.external_target)
+    return true;
   if (state.character == 0)
     return false;
   if (!enabled)
@@ -3805,9 +4206,9 @@ bool ApplyPose(Context &context, const bool enabled, const std::uint32_t bone,
   return true;
 }
 
-bool ResolvePoseTickTarget(Context &context, std::uintptr_t &target) noexcept {
+bool ResolvePoseTickTarget(Context &context, const std::uintptr_t mesh,
+                           std::uintptr_t &target) noexcept {
   target = 0;
-  const auto mesh = context.runtime.mesh;
   if (mesh == 0)
     return false;
   std::uintptr_t vtable{};
@@ -3885,34 +4286,63 @@ void DestroyStalePoseableComponent(Context &context,
                                    std::uintptr_t component) noexcept;
 
 bool ReleasePoseTickHook(Context &context) noexcept {
-  if (!HookReady(context.hook) || context.tick_hook.id == 0)
+  if (!HookReady(context.hook))
     return true;
-  const auto status =
-      context.hook->release(context.hook->user, context.tick_hook);
-  if (status.code != ANOMALY_STATUS_V1_OK) {
-    return false;
+  std::vector<PoseTickHook> records;
+  {
+    std::lock_guard<std::mutex> lock(context.tick_hooks_mutex);
+    records = context.tick_hooks;
   }
-  context.tick_hook = {};
-  context.tick_original = 0;
-  context.tick_target = 0;
-  g_active.store(nullptr, std::memory_order_release);
-  return true;
+  if (records.empty())
+    return true;
+  bool released = true;
+  for (const auto &record : records) {
+    if (record.handle.id == 0)
+      continue;
+    const auto status =
+        context.hook->release(context.hook->user, record.handle);
+    if (status.code != ANOMALY_STATUS_V1_OK)
+      released = false;
+  }
+  if (released) {
+    std::lock_guard<std::mutex> lock(context.tick_hooks_mutex);
+    context.tick_hooks.clear();
+    g_active.store(nullptr, std::memory_order_release);
+  }
+  return released;
 }
 
 bool EnsurePoseTickHook(Context &context) noexcept {
   if (!HookReady(context.hook))
     return false;
-  std::uintptr_t target{};
-  if (!ResolvePoseTickTarget(context, target))
-    return false;
-  if (context.tick_hook.id != 0 && context.tick_target == target &&
-      context.tick_original != 0)
-    return true;
-  if (context.tick_hook.id != 0) {
-    if (!ReleasePoseTickHook(context))
-      return false;
+  std::uintptr_t hook_mesh = context.runtime.mesh;
+  // When the player is selected again, a previously edited Character Studio
+  // mesh still needs the post-tick writeback. Prefer the parked entity when
+  // the player itself is not driving a motion track.
+  if (hook_mesh == context.local_mesh &&
+      !context.motion_loaded.load(std::memory_order_acquire)) {
+    for (const auto &entry : context.entity_pose_states) {
+      if (entry.first != hook_mesh && HasCachedPoseEffect(entry.second)) {
+        hook_mesh = entry.first;
+        break;
+      }
+    }
   }
-  g_active.store(&context, std::memory_order_release);
+  std::uintptr_t target{};
+  if (!ResolvePoseTickTarget(context, hook_mesh, target))
+    return false;
+  {
+    std::lock_guard<std::mutex> lock(context.tick_hooks_mutex);
+    if (context.tick_hooks.size() == 1 &&
+        context.tick_hooks.front().target == target &&
+        context.tick_hooks.front().handle.id != 0 &&
+        context.tick_hooks.front().original != 0)
+      return true;
+  }
+  // Keep a single stable MinHook detour. Releasing/reinstalling several
+  // function targets while the game is ticking is not safe.
+  if (!ReleasePoseTickHook(context))
+    return false;
   AnomalyHookRequestV1 request{sizeof(request)};
   request.kind = ANOMALY_HOOK_V1_FUNCTION;
   request.target = target;
@@ -3922,16 +4352,18 @@ bool EnsurePoseTickHook(Context &context) noexcept {
   AnomalyGenerationHandleV1 handle{};
   const auto status =
       context.hook->create(context.hook->user, &request, &original, &handle);
-  if (status.code != ANOMALY_STATUS_V1_OK || handle.id == 0 || original == 0) {
+  if (status.code != ANOMALY_STATUS_V1_OK || handle.id == 0 ||
+      original == 0) {
     g_active.store(nullptr, std::memory_order_release);
-    context.tick_hook = {};
-    context.tick_original = 0;
-    context.tick_target = 0;
     return false;
   }
-  context.tick_hook = handle;
-  context.tick_original = original;
-  context.tick_target = target;
+  {
+    std::lock_guard<std::mutex> lock(context.tick_hooks_mutex);
+    context.tick_hooks.clear();
+    context.tick_hooks.push_back(
+        PoseTickHook{handle, original, target, {hook_mesh}});
+  }
+  g_active.store(&context, std::memory_order_release);
   return true;
 }
 
@@ -3944,19 +4376,42 @@ void ANOMALY_CALL SkeletalMeshTickDetour(void *object, float delta_seconds,
   AnomalyGenerationHandleV1 lease{};
   bool leased = false;
   SkeletalMeshTickFn original = nullptr;
+  PoseTickHook hook_record{};
+  bool have_hook_record = false;
   try {
-    if (context != nullptr && context->tick_hook.id != 0 &&
-        HookReady(context->hook)) {
-      leased = context->hook
-                   ->begin_callback(context->hook->user, context->tick_hook,
-                                    &lease)
-                   .code == ANOMALY_STATUS_V1_OK;
-      original = reinterpret_cast<SkeletalMeshTickFn>(context->tick_original);
+    if (context != nullptr && HookReady(context->hook)) {
+      const auto address = reinterpret_cast<std::uintptr_t>(object);
+      {
+        std::lock_guard<std::mutex> lock(context->tick_hooks_mutex);
+        const auto found = std::find_if(
+            context->tick_hooks.begin(), context->tick_hooks.end(),
+            [address](const PoseTickHook &record) {
+              return std::find(record.meshes.begin(), record.meshes.end(),
+                               address) != record.meshes.end();
+            });
+        if (found != context->tick_hooks.end()) {
+          hook_record = *found;
+          have_hook_record = true;
+        } else if (context->tick_hooks.size() == 1) {
+          // A UE virtual tick hook is shared by every instance using that
+          // vtable function. Use the sole trampoline without probing memory
+          // from inside the detour.
+          hook_record = context->tick_hooks.front();
+          have_hook_record = true;
+        }
+      }
+      if (have_hook_record) {
+        leased = context->hook
+                     ->begin_callback(context->hook->user,
+                                      hook_record.handle, &lease)
+                     .code == ANOMALY_STATUS_V1_OK;
+        original = reinterpret_cast<SkeletalMeshTickFn>(
+            hook_record.original);
+      }
     }
   } catch (...) {
-    original = context == nullptr
-                   ? nullptr
-                   : reinterpret_cast<SkeletalMeshTickFn>(context->tick_original);
+    if (have_hook_record)
+      original = reinterpret_cast<SkeletalMeshTickFn>(hook_record.original);
   }
 
   try {
@@ -3966,14 +4421,19 @@ void ANOMALY_CALL SkeletalMeshTickDetour(void *object, float delta_seconds,
   }
 
   try {
-    if (context != nullptr &&
-        (context->motion_loaded.load(std::memory_order_acquire) ||
-         context->pose_override_enabled.load(std::memory_order_acquire)) &&
-        object == reinterpret_cast<void *>(context->runtime.mesh)) {
-      if (context->motion_loaded.load(std::memory_order_acquire))
+    if (context != nullptr) {
+      const auto address = reinterpret_cast<std::uintptr_t>(object);
+      const bool active_target =
+          address == context->runtime.mesh &&
+          (context->motion_loaded.load(std::memory_order_acquire) ||
+           context->pose_override_enabled.load(std::memory_order_acquire));
+      if (active_target &&
+          context->motion_loaded.load(std::memory_order_acquire))
         ApplyMotionPoseDirect(*context);
-      else
+      else if (active_target)
         ApplyPoseOverridesDirect(*context);
+      else if (address != context->runtime.mesh)
+        static_cast<void>(ApplyCachedEntityPose(*context, address));
     }
   } catch (...) {
   }
@@ -5238,6 +5698,116 @@ void ApplyPoseOverridesDirect(Context &context) noexcept {
   static_cast<void>(ForcePoseMeshObjectUpdate(context));
 }
 
+bool ApplyCachedEntityPose(Context &context,
+                           const std::uintptr_t mesh) noexcept {
+  const auto found = context.entity_pose_states.find(mesh);
+  if (found == context.entity_pose_states.end() ||
+      !HasCachedPoseEffect(found->second))
+    return false;
+  const EntityPoseState &saved = found->second;
+  const std::uint32_t count =
+      static_cast<std::uint32_t>(saved.base_locals.size());
+  if (count == 0 || saved.bone_parents.size() != count ||
+      saved.angles.size() < count)
+    return false;
+
+  std::uintptr_t bone_data{};
+  std::uintptr_t component_data{};
+  std::uint32_t bone_count{};
+  std::uint32_t component_count{};
+  const bool authoritative =
+      ReadArrayHeader(context, mesh + kMeshComponentSpaceBuffer0Offset,
+                      bone_data, bone_count) &&
+      ReadArrayHeader(context, mesh + kMeshComponentSpaceBuffer1Offset,
+                      component_data, component_count) &&
+      bone_data != 0 && component_data != 0 && bone_count == count &&
+      component_count == count;
+  if (!authoritative) {
+    if (!ReadArrayHeader(context, mesh + kMeshCachedBoneSpaceTransformsOffset,
+                         bone_data, bone_count) ||
+        !ReadArrayHeader(context, mesh + kMeshCachedComponentSpaceTransformsOffset,
+                         component_data, component_count) ||
+        bone_data == 0 || component_data == 0 || bone_count != count ||
+        component_count != count)
+      return false;
+  }
+
+  std::vector<Transformd> locals(count);
+  bool any_override = false;
+  for (std::uint32_t bone{}; bone != count; ++bone) {
+    const auto &raw = saved.base_locals[bone];
+    locals[bone].rotation = Quatd{raw[0], raw[1], raw[2], raw[3]};
+    locals[bone].translation = Vec3d{raw[4], raw[5], raw[6]};
+    locals[bone].scale = Vec3d{raw[8], raw[9], raw[10]};
+    const auto &angle = saved.angles[bone];
+    if (angle[0] == 0.0 && angle[1] == 0.0 && angle[2] == 0.0)
+      continue;
+    any_override = true;
+    locals[bone].rotation =
+        QuatMultiply(RotatorToQuat(angle[0], angle[1], angle[2]),
+                     locals[bone].rotation);
+  }
+  const bool has_root_offset =
+      saved.root_offset[0] != 0.0 || saved.root_offset[1] != 0.0 ||
+      saved.root_offset[2] != 0.0;
+  if (!any_override && !has_root_offset)
+    return false;
+
+  std::vector<Transformd> components(count);
+  std::vector<std::uint8_t> marks(count, 0);
+  for (std::uint32_t bone{}; bone != count; ++bone)
+    static_cast<void>(ComputeBoneComponent(bone, locals, saved.bone_parents,
+                                           components, marks));
+
+  std::vector<PackedTransform> packed(count);
+  for (std::uint32_t bone{}; bone != count; ++bone) {
+    PackTransform(components[bone], packed[bone]);
+    packed[bone].translation[0] += saved.root_offset[0];
+    packed[bone].translation[1] += saved.root_offset[1];
+    packed[bone].translation[2] += saved.root_offset[2];
+  }
+  const auto *bytes = reinterpret_cast<const std::uint8_t *>(packed.data());
+  const auto byte_count = packed.size() * sizeof(PackedTransform);
+  return WriteBytes(context, component_data, bytes, byte_count) &&
+         WriteBytes(context, bone_data, bytes, byte_count) &&
+         ForceMeshObjectUpdate(context, mesh);
+}
+
+bool MaintainParkedEntityPose(Context &context, const std::uintptr_t mesh,
+                              EntityPoseState &saved) noexcept {
+  if (!HasCachedPoseEffect(saved))
+    return false;
+
+  bool ok = ApplyCachedEntityPose(context, mesh);
+  std::uint8_t flags{};
+  if (Read(context, mesh + kMeshAnimationFlagsOffset, flags)) {
+    if (!saved.pause_saved) {
+      saved.pause_saved = true;
+      saved.original_animation_flags = flags;
+    }
+    const std::uint8_t paused = static_cast<std::uint8_t>(
+        flags | static_cast<std::uint8_t>(1U << kAnimationFlagPauseAnimsBit));
+    if (paused != flags)
+      ok = Write(context, mesh + kMeshAnimationFlagsOffset, paused) && ok;
+  } else {
+    ok = false;
+  }
+
+  std::uint8_t mode{};
+  if (Read(context, mesh + kMeshAnimationModeOffset, mode)) {
+    if (!saved.animation_mode_saved) {
+      saved.animation_mode_saved = true;
+      saved.original_animation_mode = mode;
+    }
+    if (mode != kAnimationModeCustom)
+      ok = Write(context, mesh + kMeshAnimationModeOffset,
+                 kAnimationModeCustom) && ok;
+  } else {
+    ok = false;
+  }
+  return ok;
+}
+
 // ---------------------------------------------------------------------------
 // MMD motion playback
 //
@@ -6251,8 +6821,8 @@ void StepMeshScan(Context &context) noexcept {
     if (class_name.find("MeshComponent") == std::string::npos)
       continue;
     ++context.mesh_scan_mesh_objects;
-    // Only the local player's own components: the outer of a component is the
-    // actor that owns it, so anything else in the world is filtered out here.
+    // Only the selected actor's own components: the outer of a component is
+    // the actor that owns it, so anything else in the world is filtered out.
     std::uintptr_t outer{};
     if (context.runtime.character == 0 ||
         !Read(context, object + kObjectOuterOffset, outer) ||
@@ -7188,6 +7758,122 @@ std::string ObjectNameOf(Context &context, const std::uintptr_t object) noexcept
   if (Read(context, object + kObjectNameOffset, name_id))
     static_cast<void>(ResolveName(context, name_id, name));
   return name;
+}
+
+bool IsPoseTargetRootComponent(Context &context,
+                               const std::uintptr_t component) noexcept {
+  std::uintptr_t attach_parent{};
+  if (!Read(context, component + kMeshAttachParentOffset, attach_parent) ||
+      attach_parent == 0)
+    return true;
+  // A generated actor's child costume/facial meshes point at the body through
+  // AttachParent. Only a resolved SceneComponent/Actor reference is evidence
+  // that the field is an attachment; an unrelated unreadable value must not
+  // make the root body disappear from the target list.
+  return ClassNameOf(context, attach_parent).find("Component") ==
+         std::string::npos;
+}
+
+void ApplyRequestedPoseTarget(Context &context) noexcept {
+  constexpr auto kNoRequest = (std::numeric_limits<std::uintptr_t>::max)();
+  const auto requested =
+      context.requested_pose_target.exchange(kNoRequest, std::memory_order_acq_rel);
+  if (requested == kNoRequest)
+    return;
+  if (requested == 0) {
+    context.selected_pose_target_mesh = 0;
+    return;
+  }
+  const auto found = std::find_if(
+      context.pose_targets.begin(), context.pose_targets.end(),
+      [&](const PoseTarget &target) { return target.mesh == requested; });
+  if (found != context.pose_targets.end()) {
+    context.selected_pose_target_mesh = requested;
+    return;
+  }
+  // The list is read-only and can lag one frame behind Character Studio's
+  // spawn. Re-scan instead of accepting an arbitrary address.
+  context.pose_target_scan_requested.store(true, std::memory_order_release);
+}
+
+void StepPoseTargetScan(Context &context) noexcept {
+  if (!context.pose_target_scan_requested.load(std::memory_order_acquire))
+    return;
+  if (!context.pose_target_scan_running) {
+    context.pose_target_scan_running = true;
+    context.pose_target_scan_cursor = 0;
+    context.pose_target_scan_results.clear();
+    if (context.local_character != 0 && context.local_mesh != 0)
+      context.pose_target_scan_results.push_back(
+          {context.local_character, context.local_mesh, "Player"});
+    // Character Studio can grow the object array after the previous scan.
+    // Re-read the registry header at the beginning of each target scan.
+    context.object_registry = {};
+    if (!RefreshObjectRegistry(context)) {
+      context.pose_target_scan_requested.store(false, std::memory_order_release);
+      context.pose_target_scan_running = false;
+      return;
+    }
+  }
+
+  std::uint32_t budget = 20000;
+  while (context.pose_target_scan_cursor < context.object_registry.count &&
+         budget-- != 0) {
+    const std::uint32_t index = context.pose_target_scan_cursor++;
+    std::uintptr_t object{};
+    if (!ObjectAtIndex(context, index, object) || object == 0)
+      continue;
+    const std::string class_name = ClassNameOf(context, object);
+    if (class_name.find("SkeletalMeshComponent") == std::string::npos)
+      continue;
+    std::uintptr_t owner{};
+    if (!Read(context, object + kObjectOuterOffset, owner) || owner == 0 ||
+        owner == context.local_character)
+      continue;
+    const std::string owner_class = ClassNameOf(context, owner);
+    // Character Studio's generated body is the native SkeletalMeshActor.
+    // HTSkeletalMeshActor_UID_* entries are transient helper actors and do not
+    // represent selectable character entities.
+    if (owner_class != "SkeletalMeshActor")
+      continue;
+    // Character Studio adds costume/facial components to the same
+    // SkeletalMeshActor and attaches them below the primary body component.
+    // They are not independent pose targets: selecting one would bind
+    // BetterPose to a partial skeleton and expose duplicate entries for one
+    // generated character.
+    if (!IsPoseTargetRootComponent(context, object))
+      continue;
+    std::uintptr_t data{};
+    std::uint32_t count{};
+    if (!ReadArrayHeader(context, object + kMeshComponentSpaceBuffer0Offset,
+                         data, count) ||
+        data == 0 || count == 0 || count > 4096)
+      continue;
+    if (std::find_if(context.pose_target_scan_results.begin(),
+                     context.pose_target_scan_results.end(),
+                     [&](const PoseTarget &target) {
+                       return target.mesh == object;
+                     }) != context.pose_target_scan_results.end())
+      continue;
+    std::string label = ObjectNameOf(context, owner);
+    if (label.empty())
+      label = "SkeletalMeshActor";
+    label += " [" + Hex(owner) + "]";
+    context.pose_target_scan_results.push_back({owner, object, std::move(label)});
+  }
+
+  if (context.pose_target_scan_cursor < context.object_registry.count)
+    return;
+  context.pose_target_scan_running = false;
+  context.pose_target_scan_requested.store(false, std::memory_order_release);
+  context.pose_targets = std::move(context.pose_target_scan_results);
+  if (context.selected_pose_target_mesh != 0 &&
+      std::none_of(context.pose_targets.begin(), context.pose_targets.end(),
+                   [&](const PoseTarget &target) {
+                     return target.mesh == context.selected_pose_target_mesh;
+                   })) {
+    context.selected_pose_target_mesh = 0;
+  }
 }
 
 // Read ANY mesh asset's reference (bind) skeleton: the same RawRefBoneInfo /
@@ -8178,7 +8864,7 @@ void BeginKawaiiInitialization(Context &context,
         context, extra.object, kFunctionSetAnimationModePath,
         &parameters, sizeof(parameters), detail));
   }
-  if (context.runtime.character != 0)
+  if (context.runtime.character != 0 && !context.runtime.external_target)
     static_cast<void>(CallVirtualUFunction(
         context, context.runtime.character,
         kFunctionRefreshAnimInstancePath, nullptr, 0, detail));
@@ -8451,8 +9137,8 @@ void AppendKawaiiLimits(
 
 void ResyncExtraMeshes(Context &context) noexcept {
   // Log the *state* even when this returns early: a silent no-op is what made the
-  // previous test unreadable ("还是没有" told us nothing about which precondition
-  // was missing).
+  // previous test unreadable (a bare "still nothing" told us nothing about which
+  // precondition was missing).
   const std::uint32_t parent_offset = context.attach_parent_offset;
   if (parent_offset == 0)
     return;
@@ -10761,8 +11447,8 @@ void StepMusic(Context &context, const double delta_seconds) noexcept {
 }
 
 // A track sitting next to the motion is almost always the right one, so offer it: the exact
-// basename first, then the same basename ignoring spaces (motions and songs are often named
-// "爱言叶4.vmd" / "爱言叶4 .mp3").
+// basename first, then the same basename ignoring spaces (a motion and its song are often
+// the same title with a stray space in one of the two names).
 std::string FindSiblingAudio(const std::string &motion_path) {
   std::error_code ec;
   const std::filesystem::path motion = std::filesystem::path(Utf8ToWide(motion_path));
@@ -11569,15 +12255,20 @@ void ExecutePoseFileAction(Context &context) noexcept {
                                              : "pose import queued");
 }
 void EnsureActiveCharacterProfile(Context &context) noexcept {
-  if (context.runtime.mesh == 0 || !StorageReady(context.storage))
+  if (context.runtime.mesh == 0)
     return;
   const std::string profile_id = Hex(context.runtime.mesh);
   if (profile_id.empty() || profile_id == context.active_character_id)
     return;
   const bool first_profile = !context.character_profiles_initialized;
   context.active_character_id = profile_id;
-  const int loaded = LoadCharacterPoseProfile(context, profile_id);
-  if (loaded <= 0 && !first_profile)
+  const bool cached = RestoreEntityPose(context, context.runtime.mesh);
+  const int loaded = cached
+                         ? 0
+                         : StorageReady(context.storage)
+                               ? LoadCharacterPoseProfile(context, profile_id)
+                               : -1;
+  if (loaded <= 0 && !cached && !first_profile)
     ResetPoseValues(context);
   context.character_profiles_initialized = true;
   context.pose_settings_dirty.store(true, std::memory_order_release);
@@ -11611,7 +12302,9 @@ void ExecuteReflectionAction(Context &context) noexcept {
                                 sizeof(parameters), detail);
     } else if (action == 4) {
       if (context.runtime.character == 0) {
-        detail = "local character is unavailable";
+        detail = "character is unavailable";
+      } else if (context.runtime.external_target) {
+        detail = "external pose target has no gameplay animation refresh";
       } else {
         ok = CallVirtualUFunction(context, context.runtime.character,
                                   kFunctionRefreshAnimInstancePath, nullptr, 0,
@@ -11662,6 +12355,9 @@ void PublishSnapshot(Context &context, const std::string_view status) {
   next.active = context.runtime.character != 0 && context.runtime.mesh != 0;
   next.character = context.runtime.character;
   next.mesh = context.runtime.mesh;
+  next.external_target = context.runtime.external_target;
+  next.selected_target_mesh = context.selected_pose_target_mesh;
+  next.pose_targets = context.pose_targets;
   next.anim_instance = context.runtime.anim_instance;
   next.animation_mode = context.runtime.animation_mode;
   next.bone_space_count = context.runtime.bone_space_count;
@@ -11728,9 +12424,12 @@ bool RefreshRuntime(Context &context) noexcept {
   static_cast<void>(Read(context,
                          context.runtime.mesh + kMeshGlobalAnimRateScaleOffset,
                          context.runtime.rate_scale));
-  static_cast<void>(Read(
-      context, context.runtime.character + kCharacterAnimRootMotionScaleOffset,
-      context.runtime.root_motion_scale));
+  if (context.runtime.external_target)
+    context.runtime.root_motion_scale = 1.0F;
+  else
+    static_cast<void>(Read(
+        context, context.runtime.character + kCharacterAnimRootMotionScaleOffset,
+        context.runtime.root_motion_scale));
   return true;
 }
 
@@ -12689,15 +13388,19 @@ void StepLibrary(Context &context) noexcept {
       context.library_entries = std::move(result.entries);
     }
     if (result.request.operation == 7 && result.status == "__empty_library__") {
+      const std::string empty_status =
+          context.localizer.Text("library.empty", "The library is empty; save a pose or a motion");
       std::lock_guard<std::mutex> lock(context.library_mutex);
       context.library_entries.clear();
-      context.library_status = "库为空，可以保存姿态或动作";
+      context.library_status = empty_status;
       continue;
     }
     if (!result.ok && result.request.operation == 7) {
+      const std::string empty_status =
+          context.localizer.Text("library.empty", "The library is empty; save a pose or a motion");
       std::lock_guard<std::mutex> lock(context.library_mutex);
       context.library_entries.clear();
-      context.library_status = "库为空，可以保存姿态或动作";
+      context.library_status = empty_status;
       continue;
     }
     if (!result.ok) {
@@ -12710,7 +13413,8 @@ void StepLibrary(Context &context) noexcept {
       if (!root.is_object() || root.value("format", std::string()) != "betterpose-library" ||
           root.value("version", 0U) != 1U || !root.contains("entries") ||
           !root["entries"].is_array()) {
-        SetLibraryStatus(context, "库索引损坏");
+        SetLibraryStatus(context, context.localizer.Text("library.error.index_corrupt",
+                                                         "The library index is corrupt"));
         continue;
       }
       for (const auto &item : root["entries"]) {
@@ -12738,23 +13442,29 @@ void StepLibrary(Context &context) noexcept {
       const auto root = nlohmann::json::parse(result.document, nullptr, false);
       if (!root.is_object() || root.value("format", std::string()) != "betterpose-library-pose" ||
           !ApplyPoseDocument(context, root)) {
-        SetLibraryStatus(context, "姿态库条目格式错误");
+        SetLibraryStatus(context, context.localizer.Text("library.error.pose_format",
+                                                         "The pose entry has an invalid format"));
         continue;
       }
       if (root.contains("morphs") && !ApplyLibraryExpression(context, root["morphs"])) {
-        SetLibraryStatus(context, "姿态表情数据损坏");
+        SetLibraryStatus(context, context.localizer.Text("library.error.pose_expression",
+                                                         "The pose expression data is corrupt"));
         continue;
       }
       context.pose_edit_held.store(false, std::memory_order_release);
       context.keyframe_auto_user_state_valid = false;
       context.keyframe_applied_frame = context.keyframe_frame.load(std::memory_order_acquire);
-      SetLibraryStatus(context, "已应用姿态：" + result.request.name);
+      const std::string pose_name = result.request.name;
+      const std::array<std::string_view, 1> pose_arguments{pose_name};
+      SetLibraryStatus(context, context.localizer.Format(
+                                   "library.applied_pose", "Applied pose: {0}", pose_arguments));
     } else if (result.request.operation == 4) {
       std::vector<better_pose::keyframes::Key> keys;
       std::uint32_t length{};
       std::size_t skipped{};
       if (!keyframe_impl::ParseDocument(result.document, keys, length, skipped)) {
-        SetLibraryStatus(context, "动作库条目格式错误");
+        SetLibraryStatus(context, context.localizer.Text("library.error.motion_format",
+                                                         "The motion entry has an invalid format"));
         continue;
       }
       {
@@ -12771,7 +13481,11 @@ void StepLibrary(Context &context) noexcept {
       context.keyframe_selected.store(-1, std::memory_order_release);
       context.keyframe_applied_frame = 0.0;
       context.keyframe_auto_user_state_valid = false;
-      SetLibraryStatus(context, "已加载动作：" + result.request.name);
+      const std::string motion_name = result.request.name;
+      const std::array<std::string_view, 1> motion_arguments{motion_name};
+      SetLibraryStatus(context,
+                       context.localizer.Format("library.loaded_motion", "Loaded motion: {0}",
+                                                motion_arguments));
     } else {
       SetLibraryStatus(context, result.status);
     }
@@ -12797,13 +13511,13 @@ void StepLibrary(Context &context) noexcept {
       io.kind = request == 1 ? better_pose::library::Kind::Pose
                              : better_pose::library::Kind::Motion;
       if (name.empty()) {
-        fail("名称不能为空");
+        fail(context.localizer.Text("library.error.name_empty", "The name cannot be empty"));
         return;
       }
       if (request == 1) {
         auto pose = nlohmann::json::parse(BuildPoseDocument(context), nullptr, false);
         if (!pose.is_object()) {
-          fail("姿态快照失败");
+          fail(context.localizer.Text("library.error.pose_snapshot", "The pose snapshot failed"));
           return;
         }
         pose["format"] = "betterpose-library-pose";
@@ -12817,18 +13531,20 @@ void StepLibrary(Context &context) noexcept {
       std::lock_guard<std::mutex> lock(context.library_mutex);
       const auto *entry = better_pose::library::FindById(context.library_entries, id);
       if (entry == nullptr) {
-        fail("库条目不存在");
+        fail(context.localizer.Text("library.error.entry_missing", "Library entry not found"));
         return;
       }
       io.name = entry->name;
       io.kind = entry->kind;
     }
     if (!QueueLibraryTask(context, std::move(io)))
-      fail("后台存储任务启动失败");
+      fail(context.localizer.Text("library.error.task_start",
+                                  "The background storage task could not start"));
     return;
 
   } catch (...) {
-    fail("库请求准备失败");
+    fail(context.localizer.Text("library.error.request",
+                                "The library request could not be prepared"));
   }
 }
 
@@ -13013,10 +13729,12 @@ void StepKeyframes(Context &context, const double delta_seconds) noexcept {
 }
 
 void UpdateRuntime(Context &context, const double delta_seconds) noexcept {
+  ApplyRequestedPoseTarget(context);
   if (!RefreshRuntime(context)) {
     PublishSnapshot(context, "local player character is unavailable");
     return;
   }
+  StepPoseTargetScan(context);
 
   EnsureActiveCharacterProfile(context);
   StepAutomaticCalibrationStatus(context);
@@ -13228,6 +13946,19 @@ void UpdateRuntime(Context &context, const double delta_seconds) noexcept {
   }
   const bool force_ok = ApplyMultiThreadedUpdate(context, pose_enabled);
   const bool pose_requested = pose_enabled && pose_available;
+  const bool cached_pose_requested = HasCachedEntityPose(context);
+  bool player_freeze_ok = true;
+  if (context.runtime.mesh != context.local_mesh) {
+    // The selected mesh is an external Character Studio actor.  Keep the
+    // player's own animation stopped independently of the selected target.
+    const bool keep_player_frozen =
+        context.player_freeze.active ||
+        context.pose_override_enabled.load(std::memory_order_acquire) ||
+        freeze_enabled;
+    player_freeze_ok = keep_player_frozen
+                           ? ApplyPlayerFreeze(context)
+                           : ReleasePlayerFreeze(context);
+  }
   // Two very different things can put the plugin in charge of the camera. Follow mode is a camera
   // mode of its own: it has no timeline and nothing to play, so it takes the camera the moment it
   // is switched on -- which is what makes its sliders do something and the mouse stop turning the
@@ -13262,7 +13993,8 @@ void UpdateRuntime(Context &context, const double delta_seconds) noexcept {
   }
   // The camera write rides the same mesh tick as the pose, so the hook is installed for it
   // too: that tick is the one that lands after the game has computed its own camera.
-  const bool hook_ok = !pose_requested || EnsurePoseTickHook(context);
+  const bool hook_ok =
+      !(pose_requested || cached_pose_requested) || EnsurePoseTickHook(context);
   if (context.motion_loaded.load(std::memory_order_acquire)) {
     const std::uint64_t now = GetTickCount64();
     const std::uint64_t last =
@@ -13322,10 +14054,18 @@ void UpdateRuntime(Context &context, const double delta_seconds) noexcept {
   const bool rate_ok = ApplyRate(context, rate_enabled, rate);
   const bool root_ok = ApplyRootMotion(context, root_enabled, root);
   const bool mode_ok = EnsurePoseAnimationMode(context, pose_requested);
+  SyncEntityAnimationState(context);
   if (!pose_requested) {
     static_cast<void>(RestorePose(context));
     static_cast<void>(RestoreExtraMeshes(context));
-    static_cast<void>(ReleasePoseTickHook(context));
+    if (!cached_pose_requested)
+      static_cast<void>(ReleasePoseTickHook(context));
+    // When returning to the player, RuntimeState owns the same pause/mode
+    // values seeded from player_freeze.  Release the separate hold after the
+    // normal per-target restoration has completed.
+    if (context.runtime.mesh == context.local_mesh &&
+        context.player_freeze.active && !freeze_enabled)
+      player_freeze_ok = ReleasePlayerFreeze(context) && player_freeze_ok;
   }
   if (pose_requested) {
     if (motion_active)
@@ -13333,6 +14073,15 @@ void UpdateRuntime(Context &context, const double delta_seconds) noexcept {
     else
       ApplyPoseOverridesDirect(context);
     ResyncExtraMeshes(context);
+  }
+  // Parked Character Studio meshes are not selected, so their tick is not
+  // intercepted by the active-target hook.  Reapply their cached pose from
+  // the game-thread update while their animation state is held paused.
+  for (auto &entry : context.entity_pose_states) {
+    if (entry.first != context.runtime.mesh &&
+        HasCachedPoseEffect(entry.second))
+      static_cast<void>(
+          MaintainParkedEntityPose(context, entry.first, entry.second));
   }
   if (context.motion_loaded.load(std::memory_order_acquire)) {
     const double seconds =
@@ -13350,14 +14099,17 @@ void UpdateRuntime(Context &context, const double delta_seconds) noexcept {
                 "joints active: %u fx %u", static_cast<unsigned>(active_joints),
                 static_cast<unsigned>(context.extra_resync_count));
 
-  bool settings_saved = true;
+  bool settings_saved =
+      !context.pose_settings_save_failed.load(std::memory_order_acquire);
   if (!context.t_pose_calibration_active.load(std::memory_order_acquire)) {
-    const bool settings_dirty =
-        context.pose_settings_dirty.exchange(false, std::memory_order_acquire);
-    if (settings_dirty) {
-      settings_saved = PersistPoseSettings(context);
-      if (!settings_saved)
-        context.pose_settings_dirty.store(true, std::memory_order_release);
+    const std::uint64_t now = GetTickCount64();
+    const std::uint64_t retry_after =
+        context.pose_settings_retry_after_ms.load(std::memory_order_acquire);
+    if (context.pose_settings_dirty.load(std::memory_order_acquire) &&
+        !context.pose_settings_save_queued.load(std::memory_order_acquire) &&
+        now >= retry_after) {
+      if (!QueuePoseSettingsSave(context))
+        settings_saved = false;
     }
   }
 
@@ -13368,6 +14120,8 @@ void UpdateRuntime(Context &context, const double delta_seconds) noexcept {
     PublishSnapshot(context, "failed to force pose LOD 0");
   } else if (pose_requested && !mode_ok) {
     PublishSnapshot(context, "failed to switch animation mode to custom");
+  } else if (!player_freeze_ok) {
+    PublishSnapshot(context, "failed to keep player animation paused");
   } else if (!freeze_ok) {
     PublishSnapshot(context, "failed to apply animation pause flag");
   } else if (!rate_ok) {
@@ -13389,6 +14143,149 @@ void UpdateRuntime(Context &context, const double delta_seconds) noexcept {
     PublishSnapshot(context, "pose settings save failed");
   } else {
     PublishSnapshot(context, "ok");
+  }
+}
+
+void CapturePlayerFreeze(Context &context) noexcept {
+  RuntimeState &state = context.runtime;
+  const auto previous_mesh = state.bound_mesh;
+  if (state.external_target || previous_mesh == 0 || context.local_mesh == 0 ||
+      previous_mesh != context.local_mesh ||
+      (!state.saved_pause && !state.animation_mode_applied))
+    return;
+
+  PlayerFreezeState &player = context.player_freeze;
+  player.mesh = previous_mesh;
+  player.active = false;
+  player.pause_saved = false;
+  player.mode_saved = false;
+  if (state.saved_pause) {
+    player.active = true;
+    player.pause_saved = true;
+    player.original_animation_flags = state.original_animation_flags;
+  }
+  if (state.saved_animation_mode) {
+    player.active = true;
+    player.mode_saved = true;
+    player.original_animation_mode = state.original_animation_mode;
+  }
+}
+
+bool ApplyPlayerFreeze(Context &context) noexcept {
+  PlayerFreezeState &player = context.player_freeze;
+  if (!player.active || player.mesh == 0)
+    return true;
+
+  if (player.pause_saved) {
+    std::uint8_t flags{};
+    if (!Read(context, player.mesh + kMeshAnimationFlagsOffset, flags))
+      return false;
+    const std::uint8_t pause_bit =
+        static_cast<std::uint8_t>(1U << kAnimationFlagPauseAnimsBit);
+    if ((flags & pause_bit) == 0 &&
+        !Write(context, player.mesh + kMeshAnimationFlagsOffset,
+               static_cast<std::uint8_t>(flags | pause_bit)))
+      return false;
+  }
+
+  // Use the same light-weight property write as EnsurePoseAnimationMode's
+  // fallback.  Calling SetAnimationMode here every tick would reinitialize the
+  // player's AnimInstance while another entity is selected.
+  if (player.mode_saved) {
+    std::uint8_t mode{};
+    if (!Read(context, player.mesh + kMeshAnimationModeOffset, mode))
+      return false;
+    if (mode != kAnimationModeCustom &&
+        !Write(context, player.mesh + kMeshAnimationModeOffset,
+               kAnimationModeCustom))
+      return false;
+  }
+  return true;
+}
+
+bool ReleasePlayerFreeze(Context &context) noexcept {
+  PlayerFreezeState &player = context.player_freeze;
+  if (!player.active || player.mesh == 0)
+    return true;
+
+  if (player.pause_saved &&
+      !Write(context, player.mesh + kMeshAnimationFlagsOffset,
+             player.original_animation_flags))
+    return false;
+  if (player.mode_saved &&
+      !Write(context, player.mesh + kMeshAnimationModeOffset,
+             player.original_animation_mode))
+    return false;
+  player = PlayerFreezeState{};
+  return true;
+}
+
+void SeedPlayerFreezeRuntime(Context &context,
+                             const std::uintptr_t mesh) noexcept {
+  const PlayerFreezeState &player = context.player_freeze;
+  if (!player.active || player.mesh != mesh)
+    return;
+  RuntimeState &state = context.runtime;
+  state.saved_pause = player.pause_saved;
+  state.original_animation_flags = player.original_animation_flags;
+  state.saved_animation_mode = player.mode_saved;
+  state.original_animation_mode = player.original_animation_mode;
+  state.animation_mode_applied = player.mode_saved;
+}
+
+void ParkEntityPose(Context &context, const std::uintptr_t mesh) noexcept {
+  const auto found = context.entity_pose_states.find(mesh);
+  if (found == context.entity_pose_states.end() ||
+      !HasCachedPoseEffect(found->second))
+    return;
+  static_cast<void>(ApplyCachedEntityPose(context, mesh));
+
+  EntityPoseState &saved = found->second;
+  std::uint8_t flags{};
+  if (Read(context, mesh + kMeshAnimationFlagsOffset, flags)) {
+    if (!saved.pause_saved) {
+      saved.pause_saved = true;
+      saved.original_animation_flags = flags;
+    }
+    flags |= static_cast<std::uint8_t>(1U << kAnimationFlagPauseAnimsBit);
+    static_cast<void>(Write(context, mesh + kMeshAnimationFlagsOffset, flags));
+  }
+  std::uint8_t mode{};
+  if (Read(context, mesh + kMeshAnimationModeOffset, mode) &&
+      !saved.animation_mode_saved) {
+    saved.animation_mode_saved = true;
+    saved.original_animation_mode = mode;
+  }
+  const std::uint8_t custom = kAnimationModeCustom;
+  static_cast<void>(Write(context, mesh + kMeshAnimationModeOffset, custom));
+}
+
+void SyncEntityAnimationState(Context &context) noexcept {
+  if (!context.runtime.external_target || context.runtime.mesh == 0)
+    return;
+  const auto found = context.entity_pose_states.find(context.runtime.mesh);
+  if (found == context.entity_pose_states.end())
+    return;
+  EntityPoseState &saved = found->second;
+  saved.pause_saved = context.runtime.saved_pause;
+  saved.original_animation_flags = context.runtime.original_animation_flags;
+  saved.animation_mode_saved = context.runtime.saved_animation_mode;
+  saved.animation_mode_applied = context.runtime.animation_mode_applied;
+  saved.original_animation_mode = context.runtime.original_animation_mode;
+}
+
+void RestoreParkedEntityAnimations(Context &context) noexcept {
+  for (const auto &entry : context.entity_pose_states) {
+    const std::uintptr_t mesh = entry.first;
+    const EntityPoseState &saved = entry.second;
+    if (mesh == 0)
+      continue;
+    if (saved.pause_saved)
+      static_cast<void>(Write(context, mesh + kMeshAnimationFlagsOffset,
+                              saved.original_animation_flags));
+    if (saved.animation_mode_saved)
+      static_cast<void>(Write(context, mesh + kMeshAnimationModeOffset,
+                              saved.original_animation_mode));
   }
 }
 
@@ -13418,23 +14315,56 @@ void RestoreAll(Context &context) noexcept {
 }
 
 void BindRuntimeCharacter(Context &context, const std::uintptr_t character,
-                          const std::uintptr_t mesh) noexcept {
+                          const std::uintptr_t mesh,
+                          const bool external_target) noexcept {
   auto& state = context.runtime;
-  if (state.bound_character == character && state.bound_mesh == mesh)
+  if (state.bound_character == character && state.bound_mesh == mesh &&
+      state.external_target == external_target)
     return;
   const auto previous_mesh = state.bound_mesh;
   const auto g_world_address = state.g_world_address;
+  // RestoreAll is still required for the old selected entity, but the local
+  // player's pause/custom-mode override must survive while an external entity
+  // is selected.  Capture it before RestoreAll clears the transient state.
+  CaptureEntityPose(context, previous_mesh);
+  CapturePlayerFreeze(context);
+  const auto previous_pose = context.entity_pose_states.find(previous_mesh);
+  const bool preserve_previous_pose =
+      previous_pose != context.entity_pose_states.end() &&
+      HasCachedPoseEffect(previous_pose->second);
+  if (preserve_previous_pose) {
+    state.saved_pause = false;
+    state.saved_animation_mode = false;
+    state.animation_mode_applied = false;
+  }
+  const bool preserve_player_freeze =
+      external_target && !state.external_target && context.player_freeze.active &&
+      context.player_freeze.mesh == previous_mesh;
+  if (preserve_player_freeze) {
+    state.saved_pause = false;
+    state.saved_animation_mode = false;
+    state.animation_mode_applied = false;
+  }
   RestoreAll(context);
+  if (preserve_previous_pose)
+    ParkEntityPose(context, previous_mesh);
   static_cast<void>(DropExtraMeshes(context));
   state = RuntimeState{};
   state.g_world_address = g_world_address;
   state.bound_character = character;
   state.bound_mesh = mesh;
+  state.external_target = external_target;
+  if (!external_target)
+    SeedPlayerFreezeRuntime(context, mesh);
+  else
+    SeedEntityAnimationRuntime(context, mesh);
 
   // Converted rotations and offsets belong to one skeleton, even if another
   // character has matching names/counts. Require an explicit load for the new rig.
   if (previous_mesh != 0)
     UnloadMotion(context);
+  if (previous_mesh != 0)
+    ResetPoseValues(context);
   context.main_kawaii_state.store(0, std::memory_order_release);
   context.main_kawaii_springs.store(0, std::memory_order_release);
   context.main_distance_links.store(0, std::memory_order_release);
@@ -17012,9 +17942,11 @@ void DrawKeyframeOverlay(Context &context, const AnomalyUe5AhudFrameV1 *frame) n
                  kTimelinePlayhead, true,
                  hot(layout.play_button));
   TimelineButton(frame, layout.stop_button, "|<", kTimelinePlayhead, true, hot(layout.stop_button));
-  TimelineButton(frame, layout.delete_button, "删除关键帧", kTimelineDelete, has_selected_key,
-                 hot(layout.delete_button));
-  TimelineButton(frame, layout.record_button, "记录关键帧", kTimelineRecord,
+  TimelineButton(frame, layout.delete_button,
+                 context.localizer.Text("keyframe.overlay.delete", "Delete key"), kTimelineDelete,
+                 has_selected_key, hot(layout.delete_button));
+  TimelineButton(frame, layout.record_button,
+                 context.localizer.Text("keyframe.overlay.record", "Record key"), kTimelineRecord,
                  !motion_export_timeline,
                  hot(layout.record_button));
   TimelineButton(frame, layout.export_button,
@@ -17023,8 +17955,9 @@ void DrawKeyframeOverlay(Context &context, const AnomalyUe5AhudFrameV1 *frame) n
                  true, hot(layout.export_button));
   // Usable only when zoomed in; the accent is the playhead's, like the other
   // view/playback buttons.
-  TimelineButton(frame, layout.fit_button, "显示全部", kTimelinePlayhead, zoomed,
-                 hot(layout.fit_button));
+  TimelineButton(frame, layout.fit_button,
+                 context.localizer.Text("keyframe.overlay.fit", "Fit all"), kTimelinePlayhead,
+                 zoomed, hot(layout.fit_button));
   const float key_y = lane_y[1];
   std::array<float, 3> lane_last_x{-1.0e9F, -1.0e9F, -1.0e9F};
   for (std::size_t i{}; i != layout.keys.size(); ++i) {
@@ -17094,7 +18027,10 @@ void DrawKeyframeOverlay(Context &context, const AnomalyUe5AhudFrameV1 *frame) n
       std::abs(context.keyframe_applied_frame - current_frame) < 0.5 &&
       current_key == key_count && key_count != 0;
   if (unsaved)
-    frame->draw_text(frame->user, anomaly::sdk::StringView("*未记录"), layout.track.left,
+    frame->draw_text(frame->user,
+                     anomaly::sdk::StringView(
+                         context.localizer.Text("keyframe.overlay.unsaved", "*unsaved")),
+                     layout.track.left,
                      layout.panel.bottom - 18.0F, kTimelineUnsaved, 0.85F);
   else
     frame->draw_text(frame->user,
@@ -18265,7 +19201,7 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1 *host,
   if (context == nullptr)
     return Status(ANOMALY_STATUS_V1_FAILED);
   context->host = host;
-  context->localizer = anomaly::plugins::Localizer(host);
+  context->localizer = anomaly::sdk::Localizer(host);
   context->core = Query<AnomalyCoreServiceV1>(host, ANOMALY_CORE_SERVICE_V1_ID,
                                               ANOMALY_CORE_SERVICE_V1_VERSION);
   context->signature =
@@ -18319,11 +19255,13 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1 *host,
     return Status(ANOMALY_STATUS_V1_FAILED,
                   "character pose settings are invalid");
   }
-  context->library_status = "正在读取库索引…";
+  context->library_status =
+      context->localizer.Text("library.loading", "Reading the library index...");
   Context::LibraryIoRequest library_load;
   library_load.operation = 7;  // load index
   if (!QueueLibraryTask(*context, std::move(library_load)))
-    context->library_status = "库索引读取任务启动失败";
+    context->library_status = context->localizer.Text("library.error.load_start",
+                                                      "The library index read task did not start");
   *plugin_context = context;
   return anomaly::sdk::Ok();
 }
@@ -18361,8 +19299,11 @@ AnomalyStatusV1 ANOMALY_CALL Stop(void *plugin_context, std::uint32_t) {
   context->t_pose_calibration_request.store(0, std::memory_order_release);
   context->t_pose_session = Context::TPoseCalibrationSession{};
   RestoreAll(*context);
+  RestoreParkedEntityAnimations(*context);
+  static_cast<void>(ReleasePlayerFreeze(*context));
   g_active.store(nullptr, std::memory_order_release);
   context->runtime = RuntimeState{};
+  context->player_freeze = PlayerFreezeState{};
   RenderSnapshot empty{};
   std::scoped_lock lock(context->state_mutex);
   context->snapshot = empty;
@@ -18416,6 +19357,7 @@ void ANOMALY_CALL Update(void *plugin_context, const double delta_seconds) {
     }
   } catch (...) {
     RestoreAll(*context);
+    static_cast<void>(ReleasePlayerFreeze(*context));
     PublishSnapshot(*context, "update failed; overrides restored");
   }
 }
@@ -19575,6 +20517,31 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
   const std::string character_line =
       "Character " + Hex(snapshot.character) + "  Mesh " + Hex(snapshot.mesh);
   ui->text(ui->user, anomaly::sdk::StringView(character_line));
+  const auto draw_pose_targets = [&]() {
+    ui->separator(ui->user);
+    const std::string target_label =
+        context->localizer.Text("target.title", "Pose target");
+    ui->text(ui->user, anomaly::sdk::StringView(target_label));
+    const std::string refresh_targets_label =
+        context->localizer.Text("target.refresh", "Refresh entities");
+    if (ui->button(ui->user, anomaly::sdk::StringView(refresh_targets_label),
+                   0.0F, 0.0F) != 0)
+      context->pose_target_scan_requested.store(true, std::memory_order_release);
+    for (const auto &target : snapshot.pose_targets) {
+      const bool selected = target.mesh == snapshot.mesh;
+      const std::string label =
+          std::string(selected ? "[x] " : "[ ] ") + target.label +
+          "##better-pose-target-" + Hex(target.mesh);
+      if (ui->button(ui->user, anomaly::sdk::StringView(label), 0.0F, 0.0F) != 0)
+        context->requested_pose_target.store(
+            target.mesh == context->local_mesh ? 0 : target.mesh,
+            std::memory_order_release);
+    }
+    if (snapshot.pose_targets.empty())
+      ui->text(ui->user, anomaly::sdk::StringView(
+                               context->localizer.Text(
+                                   "target.empty", "No selectable entities found")));
+  };
   const std::string anim_line = "AnimInstance " + Hex(snapshot.anim_instance) +
                                 "  Mode " + std::to_string(snapshot.animation_mode);
   ui->text(ui->user, anomaly::sdk::StringView(anim_line));
@@ -19766,9 +20733,11 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
     ui->text(ui->user, anomaly::sdk::StringView(hint));
   };
 
-  // Two pages: the MMD motion player and the joint-pose tool. Tab containers
-  // are tail members of the UI service, so a host that predates them keeps the
-  // single scrolling page.
+  // Three pages: target selection, the MMD motion player and the joint-pose
+  // tool. Target selection is deliberately first so it is the highest
+  // priority control when Character Studio has spawned multiple entities.
+  // Tab containers are tail members of the UI service, so a host that
+  // predates them keeps the single scrolling page.
   const bool can_tabs =
       HasField<AnomalyUiServiceV1,
                decltype(AnomalyUiServiceV1::begin_tab_bar)>(
@@ -19782,17 +20751,29 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       HasField<AnomalyUiServiceV1,
                decltype(AnomalyUiServiceV1::end_tab_bar)>(
           ui, offsetof(AnomalyUiServiceV1, end_tab_bar));
+  const std::string target_tab_label =
+      context->localizer.Text("tab.target", "Skeleton");
   const std::string mmd_tab_label =
       context->localizer.Text("tab.mmd", "MMD motion");
   const std::string pose_tab_label =
       context->localizer.Text("tab.pose", "Joint pose");
   const std::string library_tab_label =
-      context->localizer.Text("tab.library", "库");
+      context->localizer.Text("tab.library", "Library");
   const bool use_tabs =
       can_tabs &&
       ui->begin_tab_bar(ui->user,
                         anomaly::sdk::StringView("better-pose-pages"), 0U) != 0;
-  // The motion page is first, so it is the one the panel opens on.
+
+  const bool target_page =
+      !use_tabs ||
+      ui->begin_tab_item(ui->user, anomaly::sdk::StringView(target_tab_label),
+                         nullptr, 0U, 1) != 0;
+  if (target_page) {
+    draw_pose_targets();
+    if (use_tabs)
+      ui->end_tab_item(ui->user);
+  }
+
   const bool mmd_page =
       !use_tabs ||
       ui->begin_tab_item(ui->user, anomaly::sdk::StringView(mmd_tab_label),
@@ -22667,7 +23648,7 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       changed_angle();
     ui->same_line(ui->user, 0.0F, 4.0F);
     const std::string pitch_reset =
-        context->localizer.Label("pose.reset.pitch", "重置", "reset-pitch");
+        context->localizer.Label("pose.reset.pitch", "Reset", "reset-pitch");
     if (ui->button(ui->user, anomaly::sdk::StringView(pitch_reset), 42.0F,
                    0.0F) != 0) {
       pitch = 0.0F;
@@ -22681,7 +23662,7 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       changed_angle();
     ui->same_line(ui->user, 0.0F, 4.0F);
     const std::string yaw_reset =
-        context->localizer.Label("pose.reset.yaw", "重置", "reset-yaw");
+        context->localizer.Label("pose.reset.yaw", "Reset", "reset-yaw");
     if (ui->button(ui->user, anomaly::sdk::StringView(yaw_reset), 42.0F,
                    0.0F) != 0) {
       yaw = 0.0F;
@@ -22695,7 +23676,7 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       changed_angle();
     ui->same_line(ui->user, 0.0F, 4.0F);
     const std::string roll_reset =
-        context->localizer.Label("pose.reset.roll", "重置", "reset-roll");
+        context->localizer.Label("pose.reset.roll", "Reset", "reset-roll");
     if (ui->button(ui->user, anomaly::sdk::StringView(roll_reset), 42.0F,
                    0.0F) != 0) {
       roll = 0.0F;
@@ -22710,7 +23691,7 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       changed_root_offset();
     ui->same_line(ui->user, 0.0F, 4.0F);
     const std::string body_x_reset =
-        context->localizer.Label("pose.reset.body.x", "重置", "reset-body-x");
+        context->localizer.Label("pose.reset.body.x", "Reset", "reset-body-x");
     if (ui->button(ui->user, anomaly::sdk::StringView(body_x_reset), 42.0F,
                    0.0F) != 0) {
       root_x = 0.0F;
@@ -22724,7 +23705,7 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       changed_root_offset();
     ui->same_line(ui->user, 0.0F, 4.0F);
     const std::string body_y_reset =
-        context->localizer.Label("pose.reset.body.y", "重置", "reset-body-y");
+        context->localizer.Label("pose.reset.body.y", "Reset", "reset-body-y");
     if (ui->button(ui->user, anomaly::sdk::StringView(body_y_reset), 42.0F,
                    0.0F) != 0) {
       root_y = 0.0F;
@@ -22738,7 +23719,7 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       changed_root_offset();
     ui->same_line(ui->user, 0.0F, 4.0F);
     const std::string body_z_reset =
-        context->localizer.Label("pose.reset.body.z", "重置", "reset-body-z");
+        context->localizer.Label("pose.reset.body.z", "Reset", "reset-body-z");
     if (ui->button(ui->user, anomaly::sdk::StringView(body_z_reset), 42.0F,
                    0.0F) != 0) {
       root_z = 0.0F;
@@ -23242,19 +24223,19 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       return enabled && ui->button(ui->user, anomaly::sdk::StringView(label), 0.0F, 0.0F) != 0;
     };
     if (can_input) {
-      text(context->localizer.Text("library.name", "名称"));
+      text(context->localizer.Text("library.name", "Name"));
       ui->same_line(ui->user, 0.0F, 6.0F);
       ui->input_text(ui->user, anomaly::sdk::StringView("##library-name"),
                      context->library_name_input.data(), context->library_name_input.size(), 0);
     }
     ui->same_line(ui->user, 0.0F, 6.0F);
-    if (library_button(context->localizer.Text("library.save_pose", "保存当前姿态"))) {
+    if (library_button(context->localizer.Text("library.save_pose", "Save current pose"))) {
       std::lock_guard<std::mutex> lock(context->library_mutex);
       context->library_request_name = context->library_name_input.data();
       context->library_request.store(1, std::memory_order_release);
     }
     ui->same_line(ui->user, 0.0F, 6.0F);
-    if (library_button(context->localizer.Text("library.save_motion", "保存当前动作"))) {
+    if (library_button(context->localizer.Text("library.save_motion", "Save current motion"))) {
       std::lock_guard<std::mutex> lock(context->library_mutex);
       context->library_request_name = context->library_name_input.data();
       context->library_request.store(3, std::memory_order_release);
@@ -23294,7 +24275,7 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       library_status = context->library_status;
     }
     ui->separator(ui->user);
-    text(context->localizer.Text("library.poses", "姿态库"));
+    text(context->localizer.Text("library.poses", "Poses"));
     for (const auto &entry : entries) {
       if (entry.kind != better_pose::library::Kind::Pose)
         continue;
@@ -23302,14 +24283,14 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       if (library_button(pose_button_id))
         request_entry(2, entry);
       ui->same_line(ui->user, 0.0F, 4.0F);
-      if (library_button("重命名##" + entry.id))
+      if (library_button(context->localizer.Text("library.rename", "Rename") + "##" + entry.id))
         request_entry(5, entry);
       ui->same_line(ui->user, 0.0F, 4.0F);
-      if (library_button("删除##" + entry.id))
+      if (library_button(context->localizer.Text("library.delete", "Delete") + "##" + entry.id))
         confirm_entry(6, entry);
     }
     ui->separator(ui->user);
-    text(context->localizer.Text("library.motions", "动作库"));
+    text(context->localizer.Text("library.motions", "Motions"));
     for (const auto &entry : entries) {
       if (entry.kind != better_pose::library::Kind::Motion)
         continue;
@@ -23317,10 +24298,10 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
       if (library_button(motion_button_id))
         confirm_entry(4, entry);
       ui->same_line(ui->user, 0.0F, 4.0F);
-      if (library_button("重命名##" + entry.id))
+      if (library_button(context->localizer.Text("library.rename", "Rename") + "##" + entry.id))
         request_entry(5, entry);
       ui->same_line(ui->user, 0.0F, 4.0F);
-      if (library_button("删除##" + entry.id))
+      if (library_button(context->localizer.Text("library.delete", "Delete") + "##" + entry.id))
         confirm_entry(6, entry);
     }
     if (!library_status.empty())
@@ -23332,10 +24313,11 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
         if (ui->begin_popup_modal(ui->user, anomaly::sdk::StringView(popup), &open, 0U) != 0) {
           const int request = popup == "library-delete-confirm" ? 6 : 4;
           const std::string prompt = request == 6
-              ? context->localizer.Text("library.confirm_delete", "确定删除这个库条目？")
-              : context->localizer.Text("library.confirm_motion", "确定替换当前关键帧动作？");
+              ? context->localizer.Text("library.confirm_delete", "Delete this library entry?")
+              : context->localizer.Text("library.confirm_motion",
+                                        "Replace the current keyframe motion?");
           text(prompt);
-          if (library_button(context->localizer.Text("library.confirm_yes", "确定"))) {
+          if (library_button(context->localizer.Text("library.confirm_yes", "OK"))) {
             std::string id;
             {
               std::lock_guard<std::mutex> lock(context->library_mutex);
@@ -23351,7 +24333,7 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
             ui->close_current_popup(ui->user);
           }
           ui->same_line(ui->user, 0.0F, 6.0F);
-          if (library_button(context->localizer.Text("library.confirm_cancel", "取消")))
+          if (library_button(context->localizer.Text("library.confirm_cancel", "Cancel")))
             ui->close_current_popup(ui->user);
           ui->end_popup(ui->user);
         }
