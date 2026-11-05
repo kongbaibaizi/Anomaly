@@ -30,6 +30,8 @@
     "ANOMALY_NOTIFICATIONS_SERVICE_V1_VERSION": 1,
     "ANOMALY_SIGNATURE_SERVICE_V1_VERSION": 1,
     "ANOMALY_SIGNATURE_SERVICE_V2_VERSION": 2,
+    "ANOMALY_SIGNATURE_SERVICE_V3_VERSION": 3,
+    "ANOMALY_SIGNATURE_BATCH_MAX_PATTERNS_V3": 128,
     "ANOMALY_SIGNATURE_LAYOUT_MAX_FIELDS_V2": 32,
     "ANOMALY_SIGNATURE_LAYOUT_MAX_WITNESSES_V2": 32,
     "ANOMALY_HOOK_SERVICE_V1_VERSION": 1,
@@ -408,6 +410,25 @@
         "ANOMALY_UI_TAB_ITEM_V1_NO_TOOLTIP": 16
       }
     },
+    "AnomalyUiGlassVariantV1": {
+      "size": 4,
+      "alignment": 4,
+      "values": {
+        "ANOMALY_UI_GLASS_V1_REGULAR": 0,
+        "ANOMALY_UI_GLASS_V1_CLEAR": 1,
+        "ANOMALY_UI_GLASS_V1_MATERIAL": 2,
+        "ANOMALY_UI_GLASS_V1_THUMB": 3
+      }
+    },
+    "AnomalyUiGlassFlagsV1": {
+      "size": 4,
+      "alignment": 4,
+      "values": {
+        "ANOMALY_UI_GLASS_V1_NONE": 0,
+        "ANOMALY_UI_GLASS_V1_NO_SHADOW": 1,
+        "ANOMALY_UI_GLASS_V1_NO_RIM": 2
+      }
+    },
     "AnomalyWindowFlagsV1": {
       "size": 4,
       "alignment": 4,
@@ -425,7 +446,8 @@
         "ANOMALY_GLYPH_RANGE_V1_LATIN": 1,
         "ANOMALY_GLYPH_RANGE_V1_CYRILLIC": 2,
         "ANOMALY_GLYPH_RANGE_V1_JAPANESE": 3,
-        "ANOMALY_GLYPH_RANGE_V1_CHINESE_FULL": 4
+        "ANOMALY_GLYPH_RANGE_V1_CHINESE_FULL": 4,
+        "ANOMALY_GLYPH_RANGE_V1_PRIVATE_USE": 5
       }
     },
     "AnomalyFontStateFlagsV1": {
@@ -611,7 +633,7 @@
       }
     },
     "AnomalyPluginDescriptorV1": {
-      "size": 120,
+      "size": 128,
       "alignment": 8,
       "offsets": {
         "struct_size": 0,
@@ -626,7 +648,8 @@
         "on_stop": 88,
         "on_unload": 96,
         "on_update": 104,
-        "on_draw": 112
+        "on_draw": 112,
+        "on_overlay": 120
       }
     },
     "AnomalyCoreServiceV1": {
@@ -721,6 +744,16 @@
         "object_key_at": 88,
         "object_find": 96,
         "serialize": 104
+      }
+    },
+    "AnomalyProfileServiceV1": {
+      "size": 24,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "service_version": 4,
+        "user": 8,
+        "load": 16
       }
     },
     "AnomalyRuntimeInfoServiceV1": {
@@ -950,6 +983,18 @@
         "resolve_layout": 24
       }
     },
+    "AnomalySignatureServiceV3": {
+      "size": 40,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "service_version": 4,
+        "user": 8,
+        "resolve": 16,
+        "resolve_layout": 24,
+        "resolve_batch": 32
+      }
+    },
     "AnomalyHookServiceV1": {
       "size": 48,
       "alignment": 8,
@@ -1008,8 +1053,22 @@
         "outline_thickness": 20
       }
     },
+    "AnomalyUiGlassStyleV1": {
+      "size": 32,
+      "alignment": 4,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "variant": 8,
+        "tint_rgba": 12,
+        "rounding": 16,
+        "scale": 20,
+        "opacity": 24,
+        "refraction_scale": 28
+      }
+    },
     "AnomalyUiServiceV1": {
-      "size": 368,
+      "size": 448,
       "alignment": 8,
       "offsets": {
         "struct_size": 0,
@@ -1058,7 +1117,17 @@
         "text_wrapped": 336,
         "begin_child_auto_fit_y": 344,
         "slider_float_enabled": 352,
-        "set_next_item_width": 360
+        "set_next_item_width": 360,
+        "overlay_viewport_size": 368,
+        "overlay_glass": 376,
+        "overlay_rect_filled": 384,
+        "overlay_line": 392,
+        "overlay_circle": 400,
+        "overlay_ring_sector": 408,
+        "overlay_measure_text": 416,
+        "overlay_text": 424,
+        "overlay_glass_ring_sector": 432,
+        "draw_screen_primitives": 440
       }
     },
     "AnomalyWindowSpecV1": {
@@ -1202,7 +1271,7 @@
       }
     },
     "AnomalyTextureServiceV1": {
-      "size": 48,
+      "size": 56,
       "alignment": 8,
       "offsets": {
         "struct_size": 0,
@@ -1211,7 +1280,8 @@
         "request": 16,
         "release": 24,
         "state": 32,
-        "draw": 40
+        "draw": 40,
+        "draw_overlay": 48
       }
     },
     "AnomalyInputServiceV1": {
@@ -2199,6 +2269,7 @@
     { "id": "anomaly.config", "version": 1, "table": "AnomalyConfigServiceV1" },
     { "id": "anomaly.storage", "version": 1, "table": "AnomalyStorageServiceV1" },
     { "id": "anomaly.json", "version": 1, "table": "AnomalyJsonServiceV1" },
+    { "id": "anomaly.profile", "version": 1, "table": "AnomalyProfileServiceV1" },
     { "id": "anomaly.runtime-info", "version": 1, "table": "AnomalyRuntimeInfoServiceV1" },
     { "id": "anomaly.diagnostics", "version": 1, "table": "AnomalyDiagnosticsServiceV1" },
     { "id": "anomaly.scheduler", "version": 1, "table": "AnomalySchedulerServiceV1" },
@@ -2208,6 +2279,7 @@
     { "id": "anomaly.notifications", "version": 1, "table": "AnomalyNotificationsServiceV1" },
     { "id": "anomaly.interop.signature", "version": 1, "table": "AnomalySignatureServiceV1" },
     { "id": "anomaly.interop.signature", "version": 2, "table": "AnomalySignatureServiceV2" },
+    { "id": "anomaly.interop.signature", "version": 3, "table": "AnomalySignatureServiceV3" },
     { "id": "anomaly.interop.hook", "version": 1, "table": "AnomalyHookServiceV1" },
     { "id": "anomaly.interop.patch", "version": 1, "table": "AnomalyPatchServiceV1" },
     { "id": "anomaly.ui", "version": 1, "table": "AnomalyUiServiceV1" },

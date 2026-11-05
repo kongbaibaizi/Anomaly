@@ -186,6 +186,10 @@ std::string BuildSnapshot() {
     AppendUnsigned(output, ANOMALY_SIGNATURE_SERVICE_V1_VERSION);
     output.append(",\n    \"ANOMALY_SIGNATURE_SERVICE_V2_VERSION\": ");
     AppendUnsigned(output, ANOMALY_SIGNATURE_SERVICE_V2_VERSION);
+    output.append(",\n    \"ANOMALY_SIGNATURE_SERVICE_V3_VERSION\": ");
+    AppendUnsigned(output, ANOMALY_SIGNATURE_SERVICE_V3_VERSION);
+    output.append(",\n    \"ANOMALY_SIGNATURE_BATCH_MAX_PATTERNS_V3\": ");
+    AppendUnsigned(output, ANOMALY_SIGNATURE_BATCH_MAX_PATTERNS_V3);
     output.append(",\n    \"ANOMALY_SIGNATURE_LAYOUT_MAX_FIELDS_V2\": ");
     AppendUnsigned(output, ANOMALY_SIGNATURE_LAYOUT_MAX_FIELDS_V2);
     output.append(",\n    \"ANOMALY_SIGNATURE_LAYOUT_MAX_WITNESSES_V2\": ");
@@ -692,6 +696,25 @@ std::string BuildSnapshot() {
         false);
     AppendEnum(
         output,
+        "AnomalyUiGlassVariantV1",
+        sizeof(AnomalyUiGlassVariantV1),
+        alignof(AnomalyUiGlassVariantV1),
+        {{"ANOMALY_UI_GLASS_V1_REGULAR", ANOMALY_UI_GLASS_V1_REGULAR},
+         {"ANOMALY_UI_GLASS_V1_CLEAR", ANOMALY_UI_GLASS_V1_CLEAR},
+         {"ANOMALY_UI_GLASS_V1_MATERIAL", ANOMALY_UI_GLASS_V1_MATERIAL},
+         {"ANOMALY_UI_GLASS_V1_THUMB", ANOMALY_UI_GLASS_V1_THUMB}},
+        false);
+    AppendEnum(
+        output,
+        "AnomalyUiGlassFlagsV1",
+        sizeof(AnomalyUiGlassFlagsV1),
+        alignof(AnomalyUiGlassFlagsV1),
+        {{"ANOMALY_UI_GLASS_V1_NONE", ANOMALY_UI_GLASS_V1_NONE},
+         {"ANOMALY_UI_GLASS_V1_NO_SHADOW", ANOMALY_UI_GLASS_V1_NO_SHADOW},
+         {"ANOMALY_UI_GLASS_V1_NO_RIM", ANOMALY_UI_GLASS_V1_NO_RIM}},
+        false);
+    AppendEnum(
+        output,
         "AnomalyWindowFlagsV1",
         sizeof(AnomalyWindowFlagsV1),
         alignof(AnomalyWindowFlagsV1),
@@ -708,7 +731,8 @@ std::string BuildSnapshot() {
          {"ANOMALY_GLYPH_RANGE_V1_LATIN", ANOMALY_GLYPH_RANGE_V1_LATIN},
          {"ANOMALY_GLYPH_RANGE_V1_CYRILLIC", ANOMALY_GLYPH_RANGE_V1_CYRILLIC},
          {"ANOMALY_GLYPH_RANGE_V1_JAPANESE", ANOMALY_GLYPH_RANGE_V1_JAPANESE},
-         {"ANOMALY_GLYPH_RANGE_V1_CHINESE_FULL", ANOMALY_GLYPH_RANGE_V1_CHINESE_FULL}},
+         {"ANOMALY_GLYPH_RANGE_V1_CHINESE_FULL", ANOMALY_GLYPH_RANGE_V1_CHINESE_FULL},
+         {"ANOMALY_GLYPH_RANGE_V1_PRIVATE_USE", ANOMALY_GLYPH_RANGE_V1_PRIVATE_USE}},
         false);
     AppendEnum(
         output,
@@ -911,7 +935,8 @@ std::string BuildSnapshot() {
          {"on_stop", offsetof(AnomalyPluginDescriptorV1, on_stop)},
          {"on_unload", offsetof(AnomalyPluginDescriptorV1, on_unload)},
          {"on_update", offsetof(AnomalyPluginDescriptorV1, on_update)},
-         {"on_draw", offsetof(AnomalyPluginDescriptorV1, on_draw)}},
+         {"on_draw", offsetof(AnomalyPluginDescriptorV1, on_draw)},
+         {"on_overlay", offsetof(AnomalyPluginDescriptorV1, on_overlay)}},
         false);
     AppendStruct(
         output,
@@ -1006,6 +1031,16 @@ std::string BuildSnapshot() {
          {"object_key_at", offsetof(AnomalyJsonServiceV1, object_key_at)},
          {"object_find", offsetof(AnomalyJsonServiceV1, object_find)},
          {"serialize", offsetof(AnomalyJsonServiceV1, serialize)}},
+        false);
+    AppendStruct(
+        output,
+        "AnomalyProfileServiceV1",
+        sizeof(AnomalyProfileServiceV1),
+        alignof(AnomalyProfileServiceV1),
+        {{"struct_size", offsetof(AnomalyProfileServiceV1, struct_size)},
+         {"service_version", offsetof(AnomalyProfileServiceV1, service_version)},
+         {"user", offsetof(AnomalyProfileServiceV1, user)},
+         {"load", offsetof(AnomalyProfileServiceV1, load)}},
         false);
     AppendStruct(
         output,
@@ -1242,6 +1277,18 @@ std::string BuildSnapshot() {
         false);
     AppendStruct(
         output,
+        "AnomalySignatureServiceV3",
+        sizeof(AnomalySignatureServiceV3),
+        alignof(AnomalySignatureServiceV3),
+        {{"struct_size", offsetof(AnomalySignatureServiceV3, struct_size)},
+         {"service_version", offsetof(AnomalySignatureServiceV3, service_version)},
+         {"user", offsetof(AnomalySignatureServiceV3, user)},
+         {"resolve", offsetof(AnomalySignatureServiceV3, resolve)},
+         {"resolve_layout", offsetof(AnomalySignatureServiceV3, resolve_layout)},
+         {"resolve_batch", offsetof(AnomalySignatureServiceV3, resolve_batch)}},
+        false);
+    AppendStruct(
+        output,
         "AnomalyHookServiceV1",
         sizeof(AnomalyHookServiceV1),
         alignof(AnomalyHookServiceV1),
@@ -1300,6 +1347,20 @@ std::string BuildSnapshot() {
         false);
     AppendStruct(
         output,
+        "AnomalyUiGlassStyleV1",
+        sizeof(AnomalyUiGlassStyleV1),
+        alignof(AnomalyUiGlassStyleV1),
+        {{"struct_size", offsetof(AnomalyUiGlassStyleV1, struct_size)},
+         {"flags", offsetof(AnomalyUiGlassStyleV1, flags)},
+         {"variant", offsetof(AnomalyUiGlassStyleV1, variant)},
+         {"tint_rgba", offsetof(AnomalyUiGlassStyleV1, tint_rgba)},
+         {"rounding", offsetof(AnomalyUiGlassStyleV1, rounding)},
+         {"scale", offsetof(AnomalyUiGlassStyleV1, scale)},
+         {"opacity", offsetof(AnomalyUiGlassStyleV1, opacity)},
+         {"refraction_scale", offsetof(AnomalyUiGlassStyleV1, refraction_scale)}},
+        false);
+    AppendStruct(
+        output,
         "AnomalyUiServiceV1",
         sizeof(AnomalyUiServiceV1),
         alignof(AnomalyUiServiceV1),
@@ -1350,7 +1411,17 @@ std::string BuildSnapshot() {
          {"text_wrapped", offsetof(AnomalyUiServiceV1, text_wrapped)},
          {"begin_child_auto_fit_y", offsetof(AnomalyUiServiceV1, begin_child_auto_fit_y)},
          {"slider_float_enabled", offsetof(AnomalyUiServiceV1, slider_float_enabled)},
-         {"set_next_item_width", offsetof(AnomalyUiServiceV1, set_next_item_width)}},
+         {"set_next_item_width", offsetof(AnomalyUiServiceV1, set_next_item_width)},
+         {"overlay_viewport_size", offsetof(AnomalyUiServiceV1, overlay_viewport_size)},
+         {"overlay_glass", offsetof(AnomalyUiServiceV1, overlay_glass)},
+         {"overlay_rect_filled", offsetof(AnomalyUiServiceV1, overlay_rect_filled)},
+         {"overlay_line", offsetof(AnomalyUiServiceV1, overlay_line)},
+         {"overlay_circle", offsetof(AnomalyUiServiceV1, overlay_circle)},
+         {"overlay_ring_sector", offsetof(AnomalyUiServiceV1, overlay_ring_sector)},
+         {"overlay_measure_text", offsetof(AnomalyUiServiceV1, overlay_measure_text)},
+         {"overlay_text", offsetof(AnomalyUiServiceV1, overlay_text)},
+         {"overlay_glass_ring_sector", offsetof(AnomalyUiServiceV1, overlay_glass_ring_sector)},
+         {"draw_screen_primitives", offsetof(AnomalyUiServiceV1, draw_screen_primitives)}},
         false);
     AppendStruct(
         output,
@@ -1503,7 +1574,8 @@ std::string BuildSnapshot() {
          {"request", offsetof(AnomalyTextureServiceV1, request)},
          {"release", offsetof(AnomalyTextureServiceV1, release)},
          {"state", offsetof(AnomalyTextureServiceV1, state)},
-         {"draw", offsetof(AnomalyTextureServiceV1, draw)}},
+         {"draw", offsetof(AnomalyTextureServiceV1, draw)},
+         {"draw_overlay", offsetof(AnomalyTextureServiceV1, draw_overlay)}},
         false);
     AppendStruct(
         output,
@@ -2511,6 +2583,8 @@ std::string BuildSnapshot() {
         ANOMALY_STORAGE_SERVICE_V1_VERSION, "AnomalyStorageServiceV1", false);
     AppendService(output, ANOMALY_JSON_SERVICE_V1_ID,
         ANOMALY_JSON_SERVICE_V1_VERSION, "AnomalyJsonServiceV1", false);
+    AppendService(output, ANOMALY_PROFILE_SERVICE_V1_ID,
+        ANOMALY_PROFILE_SERVICE_V1_VERSION, "AnomalyProfileServiceV1", false);
     AppendService(output, ANOMALY_RUNTIME_INFO_SERVICE_V1_ID,
         ANOMALY_RUNTIME_INFO_SERVICE_V1_VERSION, "AnomalyRuntimeInfoServiceV1", false);
     AppendService(output, ANOMALY_DIAGNOSTICS_SERVICE_V1_ID,
@@ -2529,6 +2603,8 @@ std::string BuildSnapshot() {
         ANOMALY_SIGNATURE_SERVICE_V1_VERSION, "AnomalySignatureServiceV1", false);
     AppendService(output, ANOMALY_SIGNATURE_SERVICE_V2_ID,
         ANOMALY_SIGNATURE_SERVICE_V2_VERSION, "AnomalySignatureServiceV2", false);
+    AppendService(output, ANOMALY_SIGNATURE_SERVICE_V3_ID,
+        ANOMALY_SIGNATURE_SERVICE_V3_VERSION, "AnomalySignatureServiceV3", false);
     AppendService(output, ANOMALY_HOOK_SERVICE_V1_ID,
         ANOMALY_HOOK_SERVICE_V1_VERSION, "AnomalyHookServiceV1", false);
     AppendService(output, ANOMALY_PATCH_SERVICE_V1_ID,
