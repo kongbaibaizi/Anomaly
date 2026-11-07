@@ -41,7 +41,7 @@ namespace {
 using jelly::Skip;
 using jelly::Vector3;
 
-constexpr std::string_view kConfigSchemaId = "anomaly.plugin.jelly.settings";
+constexpr std::string_view kConfigSchemaId = "shikari.jelly.settings";
 constexpr std::uint32_t kConfigSchemaVersion = 1;
 inline constexpr std::string_view kConfigSchemaJson =
     R"({"type":"object","properties":{"enabled":{"type":"boolean"},)"
@@ -557,7 +557,8 @@ void NoteSelection() noexcept {
 
 bool LoadLayoutResource(jelly::Layout& layout, std::string& error) {
     try {
-        auto loaded = anomaly::sdk::LoadProfile(anomaly::sdk::Host(g_context.host), "compatibility.profile.json");
+        auto loaded = anomaly::sdk::LoadProfile(anomaly::sdk::Host(g_context.host), "compatibility.profile.json",
+            {"nte", "HTGame.exe", ".text", "jelly-reflection-v1"});
         if (!loaded) { error = loaded.error(); return false; }
         const auto& profile = loaded.value();
         layout = jelly::FromProfile(profile);
@@ -1881,7 +1882,7 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
     }
     *descriptor = {
         sizeof(*descriptor), ANOMALY_PLUGIN_API_V1_MAJOR, ANOMALY_PLUGIN_API_V1_MINOR,
-        anomaly::sdk::StringView("anomaly.plugin.jelly"),
+        anomaly::sdk::StringView("shikari.jelly"),
         anomaly::sdk::StringView("Jelly"),
         anomaly::sdk::StringView("Shikari"), anomaly::sdk::StringView("0.1.12"),
         Load, Start, Stop, Unload, OnUpdate, OnDraw};

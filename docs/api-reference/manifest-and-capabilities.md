@@ -11,7 +11,7 @@
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `schemaVersion` | ✅ | 常量 `2` |
-| `id` | ✅ | 规范化 ID：点分小写标签（如 `anomaly.example.my-plugin`），3–255 字符 |
+| `id` | ✅ | 插件 ID：`<作者>.<插件名>`，固定两段小写 kebab 标签（如 `b1ank.status-bar`、`anomaly.nte-teleport`），3–128 字符；第一段是作者命名空间，来源段 `local` / `builtin` / `plugin`、反域名前缀与任何第三段都被拒绝 |
 | `name` | ✅ | 显示名，1–128 字符 |
 | `description` | 否 | 插件简介，1–512 字符；宿主在插件详情的“关于”区域显示 |
 | `version` | ✅ | SemVer 字符串 |
@@ -31,7 +31,7 @@
 
 ```jsonc
 // dependencies[] 元素
-{ "id": "<qualifiedId>", "version": "<range>", "optional": false }
+{ "id": "<pluginId>", "version": "<range>", "optional": false }
 // services[] 元素
 { "id": "<qualifiedId>", "minVersion": 1, "optional": false }
 ```
@@ -41,7 +41,7 @@
 ```json
 {
   "schemaVersion": 2,
-  "id": "anomaly.example.my-plugin",
+  "id": "example.my-plugin",
   "name": "My Plugin",
   "description": "Shows current player and session diagnostics.",
   "author": "Me",
@@ -118,6 +118,7 @@ capability 约束**服务可见性与资源归属**（不是 native 代码沙箱
 | `anomaly.ue5.objects` | `ue5-objects` |
 | `anomaly.ue5.world` | `ue5-world` |
 | `anomaly.ue5.streaming-source` | `ue5-streaming-source` |
+| `anomaly.ue5.assets` | `ue5-assets` |
 | `anomaly.nte.build` | `nte-build` |
 | `anomaly.nte.esc-menu-button` | `nte-esc-menu-button` |
 | `anomaly.nte.session` | `nte-session-snapshot` |
@@ -152,3 +153,5 @@ capability 约束**服务可见性与资源归属**（不是 native 代码沙箱
 
 - `ANOMALY_STATUS_V1_PERMISSION_DENIED` — 未声明所需 capability / grant。
 - `ANOMALY_STATUS_V1_UNAVAILABLE` — 服务 / Feature 尚未发布或已降级。
+
+`anomaly.mods` v1 需要 `mods` capability；线程与开关语义见[生命周期与 Core 服务](lifecycle-and-core.md)。

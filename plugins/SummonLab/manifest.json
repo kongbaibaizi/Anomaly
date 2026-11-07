@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "id": "local.nte.summon-lab",
+  "id": "anomaly.summon-lab",
   "name": "Summon Lab",
   "description": "Summon characters with gameplay attributes initialized during native spawning, before spawn completion",
   "author": "Anomaly",
@@ -31,6 +31,10 @@
     },
     {
       "id": "anomaly.core",
+      "minVersion": 1
+    },
+    {
+      "id": "anomaly.config",
       "minVersion": 1
     },
     {
@@ -68,6 +72,19 @@
     {
       "id": "anomaly.interop.hook",
       "minVersion": 1
+    },
+    {
+      "id": "anomaly.ue5.assets",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "anomaly.scheduler",
+      "minVersion": 1
+    },
+    {
+      "id": "anomaly.storage",
+      "minVersion": 1
     }
   ],
   "capabilities": [
@@ -79,7 +96,12 @@
     "nte-session-snapshot",
     "nte-player-snapshot",
     "memory-read",
+    "memory-write",
     "interop-signature",
-    "interop-hook"
+    "interop-hook",
+    "ue5-assets",
+    "scheduler",
+    "storage",
+    "configuration"
   ]
 }

@@ -3,6 +3,7 @@
 #include <anomaly/sdk/services/core.h>
 #include <anomaly/sdk/services/interop.h>
 #include <anomaly/sdk/services/nte.h>
+#include <anomaly/sdk/services/platform.h>
 #include <anomaly/sdk/services/ui.h>
 #include <anomaly/sdk/services/ue5.h>
 
@@ -13,12 +14,16 @@
 #include "battle_graph.hpp"
 #include "native_layout.hpp"
 #include "blueprint_names.hpp"
+#include "presets.hpp"
+#include "blueprint_editor_state.hpp"
+#include "preset_file_picker.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -27,11 +32,15 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
+#include <chrono>
 #include <mutex>
+#include <type_traits>
 
 #include <nlohmann/json.hpp>
 
 #include <windows.h>
+#include <shlobj.h>
 #include <string>
 #include <vector>
 
@@ -39,23 +48,25 @@ namespace {
 
 // ---------------------------------------------------------------- 常量
 
-constexpr std::size_t kMaxRecords = 256;
 constexpr std::size_t kManagementPageSize = 10;
+constexpr std::size_t kPresetPageSize = 10;
 // SummonAI accepts signed 32-bit levels; do not impose a gameplay cap.
-constexpr std::uint32_t kMaxLevel = static_cast<std::uint32_t>(
-    std::numeric_limits<std::int32_t>::max());
-// A full summon batch and a full management selection fit alongside single actions.
-constexpr std::size_t kMaxPending = 2 * kMaxRecords + 16;
+constexpr std::uint32_t kMaxLevel = summon_lab::kMaximumLevel;
 constexpr std::size_t kTextCapacity = 256;
 constexpr std::size_t kPathCapacity = 512;
 constexpr std::size_t kAttributeNameCapacity = 96;
 constexpr std::size_t kDisplayNameCapacity = 96;
 using summon_lab::kBirthAttributeNames;
 using summon_lab::kMaxHpAttribute;
+using summon_lab::BirthPreset;
+using summon_lab::SummonSettings;
+using summon_lab::SummonPreset;
+using summon_lab::SavedConfiguration;
 
 // Parsed once per DLL generation; callbacks only read this snapshot.
 summon_lab::NativeLayout g_layout;
 bool g_layout_ready{};
+anomaly::sdk::ProfileScanCache g_profile_scans;
 using summon_lab::NativeIdentity;
 using summon_lab::MirrorEntry;
 using summon_lab::ConfigureSummon;
@@ -131,39 +142,40 @@ struct ClassEntry {
 };
 
 struct BlueprintOptions {
+    bool use_catalog_name{};
     std::string default_display_name;
     std::string normal_combat_blueprint;
 };
 
 enum class BlueprintConfigState { Pending, Unavailable, NotApplicable, NoHealth, Available };
+enum class BlueprintConfigStage { Native, Candidates, Borrowed, Complete };
+
+struct CombatConfigChoice {
+    std::string path;
+    float hp{};
+};
 
 struct BlueprintConfigCheck {
     std::string path;
     BlueprintConfigState state{BlueprintConfigState::Pending};
     std::string source;
+    std::string requested_source;
+    BlueprintConfigStage stage{BlueprintConfigStage::Native};
+    std::vector<std::string> candidates;
+    std::size_t next_candidate{};
+    std::vector<CombatConfigChoice> sources;
+};
+
+struct AdvancedConfigCheck {
+    std::string path;
+    BlueprintConfigState state{BlueprintConfigState::Pending};
+    float hp{};
 };
 
 struct AttributeValue {
     std::string name;
     float base{};
     float current{};
-};
-
-struct BirthPreset {
-    int enabled{};
-    double value{};
-};
-
-// Captured on submission; later UI edits only affect the next batch.
-struct SummonSettings {
-    std::string class_path;
-    std::string display_name;
-    std::string server_combat_blueprint;
-    std::uint32_t level{}, skill_level{};
-    bool hostile{}, pet{}, aggressive{}, ignore_player{}, compatibility{};
-    std::array<BirthPreset, kBirthAttributeNames.size()> presets{};
-    std::uint32_t count{1};
-    double spacing{5.0};
 };
 
 #ifdef _MSC_VER
@@ -177,7 +189,7 @@ struct SummonBatch {
     bool stopped{}, in_progress{};
     summon_lab::Transform origin;
     summon_lab::Vector rotation{};
-    std::uint32_t next_slot{};
+    std::uint64_t next_slot{};
     std::vector<summon_lab::Vector> occupied;
 };
 #ifdef _MSC_VER
@@ -197,6 +209,7 @@ struct Record {
     float hp{};
     float max_hp{};
     bool pet{};
+    bool mute_boss_music{}, mute_boss_dialogue{};
     SummonIdentity registration;
     std::string class_path;
     std::string server_combat_source;
@@ -208,6 +221,9 @@ struct Record {
     std::uint64_t current_target_id{};
     bool target_paused{};
     std::vector<AttributeValue> attributes;
+    std::shared_ptr<summon_lab::EditorRuntime> editor;
+    std::string editor_warning;
+    std::string editor_rule_warning;
     char label[96]{};
 };
 
@@ -234,6 +250,12 @@ struct NameTextConversion {
 };
 static_assert(sizeof(NameTextConversion) == 32);
 
+struct PresetTransfer {
+    bool importing{};
+    std::string path;
+    std::vector<SummonPreset> presets;
+};
+
 struct Context {
     const AnomalyHostApiV1* host{};
     anomaly::sdk::Localizer localizer;
@@ -249,7 +271,38 @@ struct Context {
     const AnomalyNteSessionServiceV1* session{};
     const AnomalyNtePlayerServiceV1* player{};
     const AnomalyHookServiceV1* hooks{};
+    const AnomalyUe5AssetsServiceV1* assets{};
+    const AnomalySchedulerServiceV1* scheduler{};
+    const AnomalyStorageServiceV1* storage{};
+    const AnomalyConfigServiceV1* config{};
+    AnomalyGenerationHandleV1 config_schema{}, config_task{}, preset_transfer_task{};
+    bool config_writable{}, config_dirty{}, config_stopping{};
+    std::uint64_t config_revision{};
+    std::string config_error, preset_message;
+    std::vector<SummonPreset> saved_presets;
+    std::size_t selected_preset{summon_lab::kNoPreset};
+    std::array<char, summon_lab::kPresetNameCapacity> new_preset_name{}, preset_rename{};
+    std::array<char, 96> preset_filter{};
+    std::size_t preset_page{};
+    std::array<char, summon_lab::kPresetFileNameCapacity> preset_export_name{};
+    std::string preset_export_folder, preset_import_file;
+    summon_lab::PresetFilePicker preset_picker;
+    int presets_current_blueprint{1};
+    std::shared_ptr<PresetTransfer> preset_transfer;
+    std::string catalog_base, catalog_name_table;
+    std::set<std::string, std::less<>> catalog_exclusions;
+    std::map<std::string, std::string, std::less<>> catalog_name_aliases;
+    std::map<std::string, BlueprintOptions, std::less<>> catalog_policy;
+    using CatalogLabels = std::map<std::string, std::string, std::less<>>;
+    std::atomic<std::shared_ptr<const CatalogLabels>> catalog_labels;
+    std::atomic<bool> catalog_stop{false}, catalog_busy{false}, catalog_refresh_requested{true};
+    bool catalog_preparing{}; // Game only
+    std::chrono::steady_clock::time_point catalog_preparation_started;
+    AnomalyGenerationHandleV1 catalog_task{};
+    std::array<char, 160> catalog_scan_status{};
     std::array<NativeCombatHook, 5> local_combat_hooks{};
+    std::array<NativeCombatHook, 4> story_audio_hooks{};
+    std::atomic<bool> story_audio_ready{false};
     struct DamageReportLayout {
         std::uint32_t size{}, source{}, target{}, effect{}, damage{}, hp{};
     } damage_report;
@@ -269,12 +322,10 @@ struct Context {
     bool has_invoke{};
 
     std::mutex mutex;
-    std::array<Record, kMaxRecords> records{};
-    std::size_t record_count{};
+    std::vector<Record> records;
     std::uint64_t next_record_id{1};
 
-    std::array<PendingOp, kMaxPending> pending{};
-    std::size_t pending_count{};
+    std::deque<PendingOp> pending;
     std::shared_ptr<SummonBatch> summon_batch;
 
     bool session_world_ready{};
@@ -283,6 +334,12 @@ struct Context {
 
     // 可编辑参数
     std::array<char, kPathCapacity> class_path{};
+    std::string combat_config_blueprint;
+    std::string advanced_combat_blueprint;
+    int advanced_combat_source{};
+    std::array<char, 64> combat_source_filter{};
+    std::size_t combat_source_page{};
+    AdvancedConfigCheck advanced_config;
     BlueprintConfigCheck blueprint_config;
     double blueprint_check_delay{};
     std::array<char, kDisplayNameCapacity> display_name{};
@@ -297,6 +354,9 @@ struct Context {
     int pet{};
     int aggressive{};
     int ignore_player{};
+    int mute_boss_music{};
+    int mute_boss_dialogue{};
+    int skip_cutscenes{};
     int ft_compatibility{};
     std::uint32_t summon_count{1};
     double summon_spacing{5.0};
@@ -306,7 +366,7 @@ struct Context {
     // DLL generation rather than guessing an ITextData destructor on unload.
     NameTextConversion name_text;
 
-    // 离线生成的蓝图目录（assets/summonable.json）
+    // Immutable catalog contents are prepared on Worker and swapped under the mutex
     std::vector<ClassEntry> catalog;
     std::map<std::string, BlueprintOptions, std::less<>> blueprint_options;
     char catalog_filter[64]{};
@@ -321,9 +381,340 @@ struct Context {
 
     std::array<char, kTextCapacity> last_result{};
     bool last_result_failed{};
+    summon_lab::EditorState editor;
 } g_context;
 
 std::atomic<std::uint32_t> g_pending_hint{0};
+
+// Configuration snapshots contain values only, never live actor handles.
+SummonSettings CaptureSettingsLocked() {
+    SummonSettings settings;
+    settings.class_path = g_context.class_path.data();
+    settings.combat_config_blueprint = g_context.combat_config_blueprint;
+    settings.advanced_combat_blueprint = g_context.advanced_combat_blueprint;
+    settings.advanced_combat_source = g_context.advanced_combat_source != 0;
+    settings.display_name = g_context.display_name.data();
+    settings.level = g_context.level;
+    settings.skill_level = g_context.skill_level;
+    settings.hostile = g_context.hostile != 0;
+    settings.pet = g_context.pet != 0;
+    settings.aggressive = g_context.aggressive != 0;
+    settings.ignore_player = g_context.ignore_player != 0;
+    settings.mute_boss_music = g_context.mute_boss_music != 0;
+    settings.mute_boss_dialogue = g_context.mute_boss_dialogue != 0;
+    settings.skip_cutscenes = g_context.skip_cutscenes != 0;
+    settings.compatibility = g_context.ft_compatibility != 0;
+    settings.presets = g_context.birth_presets;
+    settings.count = g_context.summon_count;
+    settings.spacing = g_context.summon_spacing;
+    if (const auto it = g_context.editor.blueprints.find(settings.class_path); it != g_context.editor.blueprints.end())
+        settings.editor = it->second;
+    return settings;
+}
+
+void ApplySettingsLocked(const SummonSettings& settings) {
+    std::snprintf(g_context.class_path.data(), g_context.class_path.size(), "%s", settings.class_path.c_str());
+    g_context.combat_config_blueprint = settings.combat_config_blueprint;
+    g_context.advanced_combat_blueprint = settings.advanced_combat_blueprint;
+    g_context.advanced_combat_source = settings.advanced_combat_source;
+    g_context.advanced_config = {};
+    std::snprintf(g_context.display_name.data(), g_context.display_name.size(), "%s", settings.display_name.c_str());
+    g_context.level = settings.level;
+    g_context.skill_level = settings.skill_level;
+    g_context.hostile = settings.hostile;
+    g_context.pet = settings.pet;
+    g_context.aggressive = settings.aggressive;
+    g_context.ignore_player = settings.ignore_player;
+    g_context.mute_boss_music = settings.mute_boss_music;
+    g_context.mute_boss_dialogue = settings.mute_boss_dialogue;
+    g_context.skip_cutscenes = settings.skip_cutscenes;
+    g_context.ft_compatibility = settings.compatibility;
+    g_context.birth_presets = settings.presets;
+    g_context.summon_count = settings.count;
+    g_context.summon_spacing = settings.spacing;
+    g_context.editor.blueprints.insert_or_assign(settings.class_path, settings.editor);
+    g_context.blueprint_config = {};
+    g_context.blueprint_check_delay = 0;
+}
+
+SavedConfiguration CaptureConfigurationLocked() {
+    SavedConfiguration saved;
+    saved.current = CaptureSettingsLocked();
+    saved.presets = g_context.saved_presets;
+    saved.editor_blueprints = g_context.editor.blueprints;
+    saved.catalog_filter = g_context.catalog_filter;
+    saved.attribute_filter = g_context.attribute_filter.data();
+    saved.only_overrides = g_context.only_overrides != 0;
+    saved.only_current_blueprint = g_context.presets_current_blueprint != 0;
+    saved.export_name = g_context.preset_export_name.data();
+    saved.export_folder = g_context.preset_export_folder;
+    saved.import_file = g_context.preset_import_file;
+    return saved;
+}
+
+AnomalyByteSpanV1 ConfigurationBytes(std::string_view text) {
+    return {reinterpret_cast<const std::uint8_t*>(text.data()), text.size()};
+}
+
+void ANOMALY_CALL SaveConfigurationWorker(void*, AnomalyGenerationHandleV1);
+
+void ScheduleConfigurationSaveLocked() {
+    if (!g_context.config_writable || g_context.config_stopping || g_context.config_task.id != 0 ||
+        g_context.scheduler == nullptr) return;
+    const auto status = g_context.scheduler->schedule(g_context.scheduler->user, 500,
+        SaveConfigurationWorker, nullptr, &g_context.config_task);
+    if (status.code != ANOMALY_STATUS_V1_OK)
+        g_context.config_error = g_context.localizer.Text("presets.save_failed", "Configuration could not be saved");
+}
+
+void ConfigurationChangedLocked() {
+    g_context.config_dirty = true;
+    ++g_context.config_revision;
+    ScheduleConfigurationSaveLocked();
+}
+
+bool SaveConfiguration() noexcept {
+    try {
+        SavedConfiguration saved;
+        std::uint64_t revision{};
+        {
+            std::scoped_lock lock(g_context.mutex);
+            if (!g_context.config_dirty || !g_context.config_writable) return true;
+            saved = CaptureConfigurationLocked();
+            revision = g_context.config_revision;
+        }
+        // Serialization, schema validation and disk I/O run on Worker/Lifecycle.
+        const auto text = summon_lab::ConfigurationJson(saved);
+        const auto status = g_context.config->write_atomic(g_context.config->user,
+            anomaly::sdk::StringView(summon_lab::kSettingsSchemaId), summon_lab::kSettingsSchemaVersion,
+            ConfigurationBytes(text));
+        std::scoped_lock lock(g_context.mutex);
+        if (status.code != ANOMALY_STATUS_V1_OK) {
+            g_context.config_error = g_context.localizer.Text("presets.save_failed", "Configuration could not be saved");
+            return false;
+        }
+        if (revision == g_context.config_revision) g_context.config_dirty = false;
+        g_context.config_error.clear();
+        return true;
+    } catch (...) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.config_error = g_context.localizer.Text("presets.save_failed", "Configuration could not be saved");
+        return false;
+    }
+}
+
+void ANOMALY_CALL SaveConfigurationWorker(void*, AnomalyGenerationHandleV1) {
+    try {
+        const bool saved = SaveConfiguration();
+        std::scoped_lock lock(g_context.mutex);
+        g_context.config_task = {};
+        if (saved && g_context.config_dirty) ScheduleConfigurationSaveLocked();
+    } catch (...) {}
+}
+
+bool LoadConfiguration() noexcept {
+    try {
+        std::uint32_t version{};
+        std::size_t size{};
+        const auto id = anomaly::sdk::StringView(summon_lab::kSettingsSchemaId);
+        const auto status = g_context.config->read(g_context.config->user, id, &version, {}, &size);
+        if (status.code == ANOMALY_STATUS_V1_NOT_FOUND) {
+            std::scoped_lock lock(g_context.mutex);
+            g_context.config_writable = true;
+            g_context.config_error.clear();
+            return true;
+        }
+        if (status.code != ANOMALY_STATUS_V1_OK || version != summon_lab::kSettingsSchemaVersion ||
+            size == 0 || size > summon_lab::kMaximumSettingsBytes) return false;
+        std::string text(size, '\0');
+        if (g_context.config->read(g_context.config->user, id, &version,
+                {reinterpret_cast<std::uint8_t*>(text.data()), text.size()}, &size).code != ANOMALY_STATUS_V1_OK ||
+            version != summon_lab::kSettingsSchemaVersion || size > text.size()) return false;
+        text.resize(size);
+        SavedConfiguration saved;
+        if (!summon_lab::ParseConfiguration(text, saved)) return false;
+        std::scoped_lock lock(g_context.mutex);
+        g_context.editor.blueprints = std::move(saved.editor_blueprints);
+        ApplySettingsLocked(saved.current);
+        g_context.saved_presets = std::move(saved.presets);
+        std::snprintf(g_context.catalog_filter, sizeof(g_context.catalog_filter), "%s", saved.catalog_filter.c_str());
+        std::snprintf(g_context.attribute_filter.data(), g_context.attribute_filter.size(), "%s", saved.attribute_filter.c_str());
+        std::snprintf(g_context.preset_export_name.data(), g_context.preset_export_name.size(), "%s", saved.export_name.c_str());
+        g_context.preset_export_folder = std::move(saved.export_folder);
+        g_context.preset_import_file = std::move(saved.import_file);
+        g_context.only_overrides = saved.only_overrides;
+        g_context.presets_current_blueprint = saved.only_current_blueprint;
+        g_context.config_writable = true;
+        g_context.config_dirty = false;
+        g_context.config_error.clear();
+        return true;
+    } catch (...) { return false; }
+}
+
+void InitializeConfiguration(const anomaly::sdk::Host& host) {
+    PWSTR documents{};
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &documents))) {
+        g_context.preset_export_folder = summon_lab::PathUtf8(std::filesystem::path(documents));
+        CoTaskMemFree(documents);
+    }
+    g_context.config = host.Query<AnomalyConfigServiceV1>(ANOMALY_CONFIG_SERVICE_V1_ID).get();
+    const auto config = g_context.config;
+    if (config != nullptr && config->struct_size >= offsetof(AnomalyConfigServiceV1, write_atomic) +
+            sizeof(config->write_atomic) && config->register_schema && config->read && config->write_atomic) {
+        const auto schema = summon_lab::ConfigurationSchema();
+        const auto status = config->register_schema(config->user, anomaly::sdk::StringView(summon_lab::kSettingsSchemaId),
+            summon_lab::kSettingsSchemaVersion, ConfigurationBytes(schema), &g_context.config_schema);
+        if (status.code == ANOMALY_STATUS_V1_OK && g_context.config_schema.id != 0 && LoadConfiguration()) return;
+    }
+    // Never replace an unreadable library with the default empty one.
+    g_context.config_error = g_context.localizer.Text("presets.load_failed", "Configuration could not be read; automatic saving is disabled");
+}
+
+std::filesystem::path PresetFilePath(std::string_view text) {
+    const std::filesystem::path path(std::u8string(text.begin(), text.end()));
+    if (!path.is_absolute() || _wcsicmp(path.extension().c_str(), L".json") != 0)
+        throw std::invalid_argument("absolute JSON path required");
+    return path;
+}
+
+std::filesystem::path PresetExportPath(std::string_view folder, std::string_view filename) {
+    std::filesystem::path name(std::u8string(filename.begin(), filename.end()));
+    if (name.empty() || name.has_parent_path() || !name.has_filename())
+        throw std::invalid_argument("file name required");
+    if (!name.has_extension()) name += L".json";
+    return PresetFilePath(summon_lab::PathUtf8(
+        std::filesystem::path(std::u8string(folder.begin(), folder.end())) / name));
+}
+
+void ConsumePresetPickerLocked() {
+    auto result = g_context.preset_picker.TakeResult();
+    if (!result || result->status == HRESULT_FROM_WIN32(ERROR_CANCELLED)) return;
+    if (FAILED(result->status)) {
+        g_context.preset_message = g_context.localizer.Text("presets.picker_failed", "File picker could not be opened");
+        return;
+    }
+    if (result->kind == summon_lab::PresetFilePicker::Kind::Folder)
+        g_context.preset_export_folder = std::move(result->path);
+    else
+        g_context.preset_import_file = std::move(result->path);
+    g_context.preset_message.clear();
+    ConfigurationChangedLocked();
+}
+
+void OpenPresetPickerLocked(summon_lab::PresetFilePicker::Kind kind) {
+    std::string initial = g_context.preset_export_folder;
+    if (kind == summon_lab::PresetFilePicker::Kind::ImportFile) {
+        initial = g_context.preset_import_file;
+        if (initial.empty()) {
+            const auto folder = std::filesystem::path(std::u8string(
+                g_context.preset_export_folder.begin(), g_context.preset_export_folder.end()));
+            initial = summon_lab::PathUtf8(folder / summon_lab::kDefaultPresetFileName);
+        }
+    }
+    const auto title = kind == summon_lab::PresetFilePicker::Kind::Folder
+        ? g_context.localizer.Text("presets.choose_folder", "Choose folder")
+        : g_context.localizer.Text("presets.choose_file", "Choose file");
+    if (!g_context.preset_picker.Start(kind, std::move(initial), title))
+        g_context.preset_message = g_context.localizer.Text("presets.picker_failed", "File picker could not be opened");
+}
+
+void WritePresetFile(const std::filesystem::path& path, std::string_view text) {
+    auto temporary = path;
+    temporary += L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    const HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("create export");
+    DWORD written{};
+    const bool complete = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) != 0 &&
+        written == text.size() && FlushFileBuffers(file) != 0;
+    CloseHandle(file);
+    if (!complete || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporary.c_str());
+        throw std::runtime_error("write export");
+    }
+}
+
+std::string BirthPresetError(const std::array<BirthPreset, kBirthAttributeNames.size()>& presets);
+
+void ANOMALY_CALL TransferPresetsWorker(void*, AnomalyGenerationHandleV1) {
+    std::shared_ptr<PresetTransfer> transfer;
+    {
+        std::scoped_lock lock(g_context.mutex);
+        transfer = g_context.preset_transfer;
+    }
+    try {
+        const auto path = PresetFilePath(transfer->path);
+        if (transfer->importing) {
+            const auto size = std::filesystem::file_size(path);
+            if (size == 0 || size > summon_lab::kMaximumSettingsBytes) throw std::runtime_error("import size");
+            std::ifstream file(path, std::ios::binary);
+            std::string text(static_cast<std::size_t>(size), '\0');
+            if (!file.read(text.data(), static_cast<std::streamsize>(text.size()))) throw std::runtime_error("read import");
+            std::vector<SummonPreset> imported;
+            if (!summon_lab::ImportPresets(text, imported)) throw std::runtime_error("import format");
+            for (const auto& preset : imported)
+                if (!BirthPresetError(preset.settings.presets).empty()) throw std::runtime_error("import attributes");
+            SavedConfiguration proposed;
+            {
+                std::scoped_lock lock(g_context.mutex);
+                proposed = CaptureConfigurationLocked();
+            }
+            // Library edits are disabled while a transfer is pending. Append only;
+            // current controls and existing presets are never replaced by import.
+            proposed.presets.insert(proposed.presets.end(), imported.begin(), imported.end());
+            static_cast<void>(summon_lab::ConfigurationJson(proposed));
+            const auto count = std::to_string(imported.size());
+            const std::array<std::string_view, 1> args{count};
+            std::scoped_lock lock(g_context.mutex);
+            g_context.saved_presets = std::move(proposed.presets);
+            g_context.presets_current_blueprint = 0;
+            g_context.preset_filter = {};
+            g_context.preset_page = 0;
+            g_context.selected_preset = summon_lab::kNoPreset;
+            g_context.preset_message = g_context.localizer.Format("presets.imported", "Imported {0} presets", args);
+            ConfigurationChangedLocked();
+        } else {
+            WritePresetFile(path, summon_lab::ExportPresets(transfer->presets));
+            std::scoped_lock lock(g_context.mutex);
+            g_context.preset_message = g_context.localizer.Text("presets.exported", "Presets exported");
+        }
+    } catch (...) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.preset_message = g_context.localizer.Text("presets.transfer_failed", "Transfer failed; check the JSON file and path");
+    }
+    std::scoped_lock lock(g_context.mutex);
+    g_context.preset_transfer.reset();
+    g_context.preset_transfer_task = {};
+}
+
+void QueuePresetTransferLocked(bool importing, bool all) {
+    if (g_context.preset_transfer || !g_context.scheduler) return;
+    auto transfer = std::make_shared<PresetTransfer>();
+    transfer->importing = importing;
+    if (importing) transfer->path = g_context.preset_import_file;
+    else {
+        try {
+            transfer->path = summon_lab::PathUtf8(PresetExportPath(
+                g_context.preset_export_folder, g_context.preset_export_name.data()));
+        } catch (...) {
+            g_context.preset_message = g_context.localizer.Text("presets.invalid_filename", "Enter a JSON file name without a path");
+            return;
+        }
+    }
+    if (!importing) {
+        if (all) transfer->presets = g_context.saved_presets;
+        else if (g_context.selected_preset < g_context.saved_presets.size())
+            transfer->presets.push_back(g_context.saved_presets[g_context.selected_preset]);
+        if (transfer->presets.empty()) return;
+    }
+    g_context.preset_transfer = std::move(transfer);
+    g_context.preset_message = g_context.localizer.Text("presets.transferring", "Transferring presets");
+    const auto status = g_context.scheduler->schedule(g_context.scheduler->user, 0,
+        TransferPresetsWorker, nullptr, &g_context.preset_transfer_task);
+    if (status.code != ANOMALY_STATUS_V1_OK) {
+        g_context.preset_transfer.reset();
+        g_context.preset_message = g_context.localizer.Text("presets.transfer_failed", "Transfer failed; check the JSON file and path");
+    }
+}
 
 // ---------------------------------------------------------------- 安全读 / 日志
 
@@ -466,10 +857,7 @@ bool FindLocalPawn(AnomalyGenerationHandleV1* out) {
 
 // ---------------------------------------------------------------- 蓝图目录
 
-// 目录来自离线导出：FModel 把 HT/Content/Blueprints 全量导成 JSON，脚本按
-// Super ／ SuperStruct 链结合 dump 出来的 SDK 头，挑出继承 HTAICharacter 的蓝图，
-// 落成 assets/summonable.json。运行时只读这份目录，不再扫内存注册表——
-// 未加载的蓝图类根本不在注册表里，扫不出完整清单。
+// Only gameplay policy is shipped; the class/name catalog comes from ue5.assets.
 // 宿主把整个插件包原样复制到 .cache\<pid>\packages\<id>\<generation>\ 再加载 DLL，
 // assets/ 在 DLL 旁边；profile/ 由宿主的 anomaly.profile 服务加载。
 std::wstring PackagePath(const wchar_t* relative_path) {
@@ -491,81 +879,193 @@ std::wstring PackagePath(const wchar_t* relative_path) {
     return std::filesystem::is_regular_file(path, error) ? path.wstring() : std::wstring{};
 }
 
-bool LoadCatalog() {
-    const std::wstring path = PackagePath(L"assets/summonable.json");
-    if (path.empty()) {
-        return false;
+bool LoadCatalogPolicy() {
+    const auto path = PackagePath(L"assets/catalog-policy.json");
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+    const auto root = nlohmann::json::parse(input, nullptr, false);
+    if (!root.is_object() || root.value("schemaVersion", 0) != 1) return false;
+    g_context.catalog_base = root.at("baseClass").get<std::string>();
+    g_context.catalog_name_table = root.at("nameTable").get<std::string>();
+    g_context.catalog_exclusions = root.at("excludedBlueprints").get<std::set<std::string, std::less<>>>();
+    for (const auto& [key, value] : root.at("blueprints").items()) {
+        BlueprintOptions options;
+        options.use_catalog_name = value.value("useCatalogName", false);
+        options.normal_combat_blueprint = value.value("normalCombatBlueprint", std::string{});
+        g_context.catalog_policy.emplace(key, std::move(options));
     }
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        return false;
-    }
-    const std::string document((std::istreambuf_iterator<char>(in)),
-                               std::istreambuf_iterator<char>());
-    in.close();
+    g_context.catalog_name_aliases = root.at("nameAliases").get<decltype(g_context.catalog_name_aliases)>();
+    const auto& ft = root.at("finalTower");
+    g_context.final_tower_scene_asset = ft.at("sceneDataAsset").get<std::string>();
+    g_context.final_tower_aliases = ft.at("configAliases").get<std::map<std::string, std::string, std::less<>>>();
+    g_context.final_tower_combat_blueprint = ft.at("serverCombatBlueprint").get<std::string>();
+    return true;
+}
 
-    const auto root = nlohmann::json::parse(document, nullptr, false);
-    if (root.is_discarded() || !root.is_object()) {
-        return false;
-    }
-    if (root.value("schemaVersion", 0) != 1) {
-        return false;
-    }
-    const auto groups = root.find("groups");
-    if (groups == root.end() || !groups->is_array()) {
-        return false;
-    }
+void SetScanStatus(const char* key, const char* fallback, std::string_view argument = {}) {
+    const std::array<std::string_view, 1> args{argument};
+    const auto text = argument.empty() ? g_context.localizer.Text(key, fallback) :
+        g_context.localizer.Format(key, fallback, args);
+    std::scoped_lock lock(g_context.mutex);
+    std::snprintf(g_context.catalog_scan_status.data(), g_context.catalog_scan_status.size(), "%s", text.c_str());
+}
 
+void LogCatalogFailure(const AnomalyStatusV1& status) {
+    // Preserve the service's diagnostic detail without adding technical UI text.
+    if (g_context.core && g_context.core->log && status.message.data && status.message.size)
+        g_context.core->log(g_context.core->user, ANOMALY_CORE_LOG_LEVEL_V1_WARNING, status.message);
+}
+
+constexpr char kCatalogCacheFile[] = "catalog-cache.json";
+struct CatalogCollection {
+    std::vector<std::string> paths;
+    std::map<std::string, std::string, std::less<>> names;
+};
+
+bool PublishCatalog(CatalogCollection& collection) {
+    if (collection.paths.empty() || collection.names.empty()) return false;
+    std::sort(collection.paths.begin(), collection.paths.end());
+    collection.paths.erase(std::unique(collection.paths.begin(), collection.paths.end()), collection.paths.end());
+    auto table = std::make_shared<summon_lab::ActorNameTable>();
+    std::set<std::string> ambiguous;
+    for (const auto& [key, name] : collection.names) {
+        if (name.empty()) continue;
+        auto identity = summon_lab::NameIdentity(key);
+        if (identity.empty() || ambiguous.contains(identity)) continue;
+        const auto [at, added] = table->emplace(identity, name);
+        if (!added && at->second != name) { table->erase(at); ambiguous.insert(std::move(identity)); }
+    }
+    for (const auto& [identity, key] : g_context.catalog_name_aliases) {
+        const auto name = collection.names.find(key);
+        if (name != collection.names.end() && !name->second.empty())
+            table->insert_or_assign(summon_lab::NameIdentity(identity), name->second);
+    }
     std::vector<ClassEntry> parsed;
-    std::map<std::string, BlueprintOptions, std::less<>> options;
-    parsed.reserve(static_cast<std::size_t>(root.value("count", 0)) + 16);
-    for (const auto& group : *groups) {
-        if (!group.is_object()) continue;
-        const std::string prefix = group.value("prefix", std::string{});
-        const auto items = group.find("entries");
-        if (items == group.end() || !items->is_array()) continue;
-        for (const auto& item : *items) {
-            if (!item.is_object()) continue;
-            const std::string name = item.value("n", std::string{});
-            const std::string package = item.value("p", std::string{});
-            if (name.empty() || package.empty()) continue;
-            const auto names = summon_lab::ResolveBlueprintNames(name, g_context.localizer);
-            const std::string& display_name = names.specific.empty() ? names.family : names.specific;
-            const std::string label = display_name.empty() ? name : display_name + " | " + name;
-            const std::string class_path = prefix + package + "." + name;
-            parsed.push_back(ClassEntry{label, class_path,
-                                        label + "\n" + class_path + "\n" + names.family});
-            BlueprintOptions entry_options;
-            if (item.value("useCatalogName", false)) entry_options.default_display_name = display_name;
-            entry_options.normal_combat_blueprint = item.value("normalCombatBlueprint", std::string{});
-            if (!entry_options.default_display_name.empty() || !entry_options.normal_combat_blueprint.empty())
-                options.emplace(class_path, std::move(entry_options));
-        }
+    parsed.reserve(collection.paths.size());
+    auto labels = std::make_shared<Context::CatalogLabels>();
+    auto options = g_context.catalog_policy;
+    for (const auto& path : collection.paths) {
+        if (path.size() > kPathCapacity - 1 || !path.starts_with('/') || !path.ends_with("_C") ||
+            path.find('\0') != std::string::npos || path.find('.') == std::string::npos) return false;
+        if (g_context.catalog_exclusions.contains(path)) continue;
+        const auto name = path.substr(path.rfind('.') + 1);
+        const auto names = summon_lab::ResolveBlueprintNames(name, *table);
+        const auto& display = names.specific.empty() ? names.family : names.specific;
+        const auto label = display.empty() ? name : display + " | " + name;
+        parsed.push_back({label, path, label + "\n" + path + "\n" + names.family});
+        labels->emplace(path, label);
+        if (auto it = options.find(path); it != options.end() && it->second.use_catalog_name)
+            it->second.default_display_name = display;
     }
-    for (const auto& [class_path, entry_options] : options) {
-        const auto& alternative = entry_options.normal_combat_blueprint;
-        if (entry_options.default_display_name.size() >= kDisplayNameCapacity ||
-            (!alternative.empty() && (alternative.size() >= kPathCapacity || alternative == class_path ||
-                std::none_of(parsed.begin(), parsed.end(), [&](const auto& entry) {
-                    return entry.path == alternative;
-                })))) return false;
+    for (auto& [path, option] : options) {
+        if (option.default_display_name.size() >= kDisplayNameCapacity) return false;
+        auto& alternative = option.normal_combat_blueprint;
+        if (alternative.size() >= kPathCapacity || (!alternative.empty() && alternative == path)) return false;
+        if (!alternative.empty() && !labels->contains(alternative)) alternative.clear();
     }
-
+    if (parsed.empty() || g_context.catalog_stop.load(std::memory_order_acquire)) return false;
     {
         std::scoped_lock lock(g_context.mutex);
-        g_context.catalog = std::move(parsed);
-        g_context.blueprint_options = std::move(options);
-        const auto ft = root.find("finalTower");
-        if (ft != root.end()) {
-            // Asset paths and row aliases are game data, alongside the blueprint catalog.
-            g_context.final_tower_scene_asset = ft->at("sceneDataAsset").get<std::string>();
-            g_context.final_tower_aliases = ft->at("configAliases").get<
-                std::map<std::string, std::string, std::less<>>>();
-            g_context.final_tower_combat_blueprint = ft->value("serverCombatBlueprint", std::string{});
-        }
+        g_context.catalog.swap(parsed);
+        g_context.blueprint_options.swap(options);
         g_context.catalog_loaded = true;
+        g_context.blueprint_config = {};
+        g_context.advanced_config = {};
+        g_context.catalog_labels.store(std::move(labels), std::memory_order_release);
     }
     return true;
+}
+
+void LoadCatalogCache() {
+    if (!g_context.storage || g_context.catalog_base.empty()) return;
+    std::size_t size{};
+    const auto storage = g_context.storage;
+    const auto path = anomaly::sdk::StringView(kCatalogCacheFile);
+    if (storage->read(storage->user, path, {}, &size).code != ANOMALY_STATUS_V1_OK ||
+        size == 0 || size > 4U * 1024U * 1024U) return;
+    std::vector<std::uint8_t> bytes(size);
+    if (storage->read(storage->user, path, {bytes.data(), bytes.size()}, &size).code != ANOMALY_STATUS_V1_OK) return;
+    const auto root = nlohmann::json::parse(bytes.begin(), bytes.begin() + size, nullptr, false);
+    if (!root.is_object() || root.value("schemaVersion", 0) != 1 ||
+        root.value("baseClass", std::string{}) != g_context.catalog_base ||
+        root.value("nameTable", std::string{}) != g_context.catalog_name_table) return;
+    CatalogCollection collection;
+    collection.paths = root.at("classes").get<std::vector<std::string>>();
+    collection.names = root.at("names").get<decltype(collection.names)>();
+    if (PublishCatalog(collection)) SetScanStatus("catalog.scan.cached", "Cached catalog");
+}
+
+int ANOMALY_CALL CollectAssetClass(void* user, AnomalyStringViewV1 path) noexcept {
+    try {
+        if (g_context.catalog_stop.load(std::memory_order_acquire)) return 0;
+        static_cast<CatalogCollection*>(user)->paths.emplace_back(path.data, path.size);
+        return 1;
+    } catch (...) { return 0; }
+}
+int ANOMALY_CALL CollectAssetName(void* user, AnomalyStringViewV1 key, AnomalyStringViewV1 name) noexcept {
+    try {
+        if (g_context.catalog_stop.load(std::memory_order_acquire)) return 0;
+        static_cast<CatalogCollection*>(user)->names.emplace(std::string(key.data, key.size), std::string(name.data, name.size));
+        return 1;
+    } catch (...) { return 0; }
+}
+
+void ANOMALY_CALL RefreshCatalogWorker(void*, AnomalyGenerationHandleV1) noexcept {
+    struct Complete { ~Complete() { g_context.catalog_busy.store(false, std::memory_order_release); } } complete;
+    try {
+        CatalogCollection collection;
+        const auto assets = g_context.assets;
+        auto result = assets->enumerate_derived(assets->user, anomaly::sdk::StringView(g_context.catalog_base), CollectAssetClass, &collection);
+        if (result.code == ANOMALY_STATUS_V1_OK)
+            result = assets->enumerate_string_table(assets->user, anomaly::sdk::StringView(g_context.catalog_name_table), CollectAssetName, &collection);
+        if (g_context.catalog_stop.load(std::memory_order_acquire)) return;
+        if (result.code != ANOMALY_STATUS_V1_OK || !PublishCatalog(collection)) {
+            LogCatalogFailure(result);
+            SetScanStatus("catalog.scan.failed", "Catalog refresh failed");
+            return;
+        }
+        const auto document = nlohmann::json{{"schemaVersion", 1}, {"baseClass", g_context.catalog_base},
+            {"nameTable", g_context.catalog_name_table}, {"classes", collection.paths}, {"names", collection.names}}.dump();
+        const auto storage = g_context.storage;
+        if (!storage || storage->write_atomic(storage->user, anomaly::sdk::StringView(kCatalogCacheFile),
+                {reinterpret_cast<const std::uint8_t*>(document.data()), document.size()}).code != ANOMALY_STATUS_V1_OK) {
+            SetScanStatus("catalog.scan.cache_failed", "Catalog ready, cache unavailable");
+            return;
+        }
+        SetScanStatus("catalog.scan.done", "Catalog ready: {0} classes", std::to_string(collection.paths.size()));
+    } catch (...) { SetScanStatus("catalog.scan.failed", "Catalog refresh failed"); }
+}
+
+void AdvanceCatalogPreparation() {
+    if (g_context.catalog_stop.load(std::memory_order_acquire)) return;
+    if (!g_context.catalog_preparing && !g_context.catalog_busy.load(std::memory_order_acquire) &&
+        g_context.catalog_refresh_requested.exchange(false, std::memory_order_acq_rel)) {
+        g_context.catalog_preparing = true;
+        g_context.catalog_preparation_started = std::chrono::steady_clock::now();
+        g_context.catalog_busy.store(true, std::memory_order_release);
+        SetScanStatus("catalog.scan.running", "Refreshing catalog");
+    }
+    if (!g_context.catalog_preparing) return;
+    const auto assets = g_context.assets;
+    if (!assets || !g_context.scheduler || g_context.catalog_base.empty()) {
+        SetScanStatus("catalog.scan.unavailable", "Asset registry is unavailable");
+        g_context.catalog_preparing = false;
+        g_context.catalog_busy.store(false, std::memory_order_release);
+        return;
+    }
+    auto result = assets->prepare_class(assets->user, anomaly::sdk::StringView(g_context.catalog_base));
+    if (result.code == ANOMALY_STATUS_V1_OK)
+        result = assets->prepare_string_table(assets->user, anomaly::sdk::StringView(g_context.catalog_name_table));
+    if (result.code == ANOMALY_STATUS_V1_UNAVAILABLE &&
+        std::chrono::steady_clock::now() - g_context.catalog_preparation_started < std::chrono::seconds(30)) return;
+    g_context.catalog_preparing = false;
+    if (result.code == ANOMALY_STATUS_V1_OK)
+        result = g_context.scheduler->schedule(g_context.scheduler->user, 0, RefreshCatalogWorker, nullptr, &g_context.catalog_task);
+    if (result.code != ANOMALY_STATUS_V1_OK) {
+        LogCatalogFailure(result);
+        SetScanStatus("catalog.scan.failed", "Catalog refresh failed");
+        g_context.catalog_busy.store(false, std::memory_order_release);
+    }
 }
 
 // ---------------------------------------------------------------- 软类引用
@@ -946,14 +1446,16 @@ struct BirthAttribute {
 struct CombatConfigSource {
     std::string config_name;
     std::string row_name;
+    std::string server_blueprint;
     std::uint64_t config{};
+    std::uint64_t row_alias{};
     std::uint64_t pack{};
     std::uintptr_t row{};
     std::uintptr_t property_pack{};
     std::int32_t level{};
 };
 
-CombatConfigSource PrepareFinalTowerConfig(std::string_view config_name);
+CombatConfigSource PrepareCombatConfig(std::string_view config_name, std::string_view source_blueprint = {});
 
 struct BirthInitialization {
     std::uintptr_t actor_class{};
@@ -966,6 +1468,12 @@ struct BirthInitialization {
     std::int32_t registration_index{-1};
     std::uintptr_t registration_cdo{};
     bool registration_substituted{};
+    bool mute_boss_music{}, mute_boss_dialogue{};
+    bool skip_cutscenes{};
+    std::uintptr_t story_audio_actor{};
+    std::vector<summon_lab::EditorField> editor_fields;
+    std::uintptr_t editor_actor{};
+    bool editor_attempted{}, editor_applied{};
 };
 
 using AttributeBaseInputFn = void (ANOMALY_CALL*)(void*, const void*, float);
@@ -1027,7 +1535,6 @@ void ClearSummonedState() {
     g_context.health_event_lookup_pending = g_context.health_observer.id != 0;
     std::scoped_lock lock(g_context.mutex);
     g_context.records = {};
-    g_context.record_count = 0;
     g_context.selected_record_id = 0;
     g_context.management_page = 0;
     g_context.management_blueprint.clear();
@@ -1035,11 +1542,16 @@ void ClearSummonedState() {
     g_context.aggro_edit_members.clear();
     g_context.aggro_edit = {};
     g_context.pending = {};
-    g_context.pending_count = 0;
     g_context.summon_batch.reset();
     g_context.blueprint_config = {};
+    g_context.advanced_config = {};
     g_context.blueprint_check_delay = 0;
     g_pending_hint.store(0, std::memory_order_release);
+    g_context.editor.scan = {};
+    g_context.editor.snapshot = {};
+    g_context.editor.requested_path.clear();
+    g_context.editor.load_requested = false;
+    g_context.editor.record_cursor = 0;
 }
 
 void RegisterLocalBirth(AnomalyGenerationHandleV1 handle, std::uintptr_t actor,
@@ -1354,7 +1866,8 @@ void TransferLocalBirths(bool save) noexcept {
                         {"actor", binding.actor}, {"abilitySystem", binding.ability_system},
                         {"attributeSet", binding.attribute_set},
                         {"exactHP", binding.exact_hp},
-                        {"combatConfig", binding.combat_config.config_name}});
+                        {"combatConfig", binding.combat_config.config_name},
+                        {"combatSource", binding.combat_config.server_blueprint}});
             }
             std::ofstream file(path, std::ios::binary | std::ios::trunc);
             file << nlohmann::json{{"schemaVersion", 1}, {"pid", GetCurrentProcessId()},
@@ -1376,6 +1889,7 @@ void TransferLocalBirths(bool save) noexcept {
                 item.value("attributeSet", static_cast<std::uintptr_t>(0)),
                 item.value("exactHP", 0.0F)};
             binding.combat_config.config_name = item.value("combatConfig", std::string{});
+            binding.combat_config.server_blueprint = item.value("combatSource", std::string{});
             g_pending_local_births.push_back(std::move(binding));
         }
         g_restore_local_births.store(!g_pending_local_births.empty(), std::memory_order_release);
@@ -1397,7 +1911,7 @@ void RestoreLocalBirthsOnGameThread() {
             ResolveActorAttributeSet(binding.actor, &asc, &set) && asc == binding.ability_system)
         {
             RegisterLocalBirth(current, binding.actor, asc, set, binding.exact_hp,
-                PrepareFinalTowerConfig(binding.combat_config.config_name));
+                PrepareCombatConfig(binding.combat_config.config_name, binding.combat_config.server_blueprint));
         }
     }
     g_pending_local_births.clear();
@@ -1499,8 +2013,7 @@ void ANOMALY_CALL AttributeBaseInputDetour(void* self, const void* attribute,
 }
 
 bool ValidateSummonProfile(const anomaly::sdk::Profile& profile, summon_lab::NativeLayout* output) {
-    if (profile.game != "nte" || profile.module != "HTGame.exe" ||
-        profile.section != ".text" || profile.contract != "summon-lab-v2") return false;
+    if (!profile.Matches({"nte", "HTGame.exe", ".text", "summon-lab-v2"})) return false;
     try {
         summon_lab::NativeLayout layout;
         if (!summon_lab::LoadNativeLayout(profile, &layout)) return false;
@@ -1529,16 +2042,13 @@ bool ValidateSummonProfile(const anomaly::sdk::Profile& profile, summon_lab::Nat
 }
 
 bool InstallBirthAttributeHook(const anomaly::sdk::Host& query, const anomaly::sdk::Profile& profile) {
-    const auto signature = query.Query<AnomalySignatureServiceV1>(
-        ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION);
     g_context.hooks = query.Query<AnomalyHookServiceV1>(
         ANOMALY_HOOK_SERVICE_V1_ID, ANOMALY_HOOK_SERVICE_V1_VERSION).get();
-    if (!signature || signature->resolve == nullptr || g_context.hooks == nullptr ||
+    if (g_context.hooks == nullptr ||
         g_context.hooks->create == nullptr || g_context.hooks->release == nullptr ||
         g_context.hooks->begin_callback == nullptr || g_context.hooks->end_callback == nullptr)
         return false;
-    const auto resolved = anomaly::sdk::ResolveProfileSymbol(
-        signature.get(), g_context.core, profile, "attribute-base-input");
+    const auto resolved = g_profile_scans.Resolve(g_context.core, profile, "attribute-base-input");
     if (!resolved) return false;
     AnomalyHookRequestV1 request{sizeof(request)};
     request.kind = ANOMALY_HOOK_V1_FUNCTION;
@@ -1591,7 +2101,7 @@ void ANOMALY_CALL LocalRegistrationDetour(void* controller, const void* leader,
                         birth->registration_leader.data(), birth->registration_leader.size())) {
                     birth->registration_controller = reinterpret_cast<std::uintptr_t>(controller);
                     birth->registration_index = index;
-                    // Only this explicit FT birth may borrow a server CDO.
+                    // Only this birth's configured source may supply a server CDO.
                     // Keep the actor class, leader bytes and summon index intact.
                     if (birth->registration_cdo != 0) {
                         class_cdo = reinterpret_cast<void*>(birth->registration_cdo);
@@ -1753,12 +2263,9 @@ std::uintptr_t ANOMALY_CALL ObserveNativeDamageReport(std::uintptr_t controller,
     return report;
 }
 
-bool InstallDamageReportObserver(const anomaly::sdk::Host& host, const anomaly::sdk::Profile& profile) {
+bool InstallDamageReportObserver(const anomaly::sdk::Profile& profile) {
     try {
-        const auto signature = host.Query<AnomalySignatureServiceV1>(
-            ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION);
-        const auto resolved = anomaly::sdk::ResolveProfileSymbol(
-            signature.get(), g_context.core, profile, "native-damage-report");
+        const auto resolved = g_profile_scans.Resolve(g_context.core, profile, "native-damage-report");
         if (!resolved) return false;
         const auto& values = resolved.candidate->values;
         Context::DamageReportLayout layout{values.at("recordSize"), values.at("sourceIdentity"),
@@ -1782,19 +2289,15 @@ bool InstallDamageReportObserver(const anomaly::sdk::Host& host, const anomaly::
     } catch (const std::out_of_range&) { return false; }
 }
 
-bool InstallLocalCombatHooks(const anomaly::sdk::Host& query, const anomaly::sdk::Profile& profile) {
-    const auto signature = query.Query<AnomalySignatureServiceV1>(
-        ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION);
-    if (!signature || signature->resolve == nullptr || g_context.hooks == nullptr ||
+bool InstallLocalCombatHooks(const anomaly::sdk::Profile& profile) {
+    if (g_context.hooks == nullptr ||
         g_context.hooks->create == nullptr || g_context.hooks->release == nullptr ||
         g_context.hooks->begin_callback == nullptr || g_context.hooks->end_callback == nullptr)
         return false;
     constexpr std::array<std::string_view, 2> names{
         "summon-registration", "local-attribute-mirror"};
-    const auto registration = anomaly::sdk::ResolveProfileSymbol(
-        signature.get(), g_context.core, profile, names[0]);
-    const auto mirror = anomaly::sdk::ResolveProfileSymbol(
-        signature.get(), g_context.core, profile, names[1]);
+    const auto registration = g_profile_scans.Resolve(g_context.core, profile, names[0]);
+    const auto mirror = g_profile_scans.Resolve(g_context.core, profile, names[1]);
     if (!registration || !mirror) return false;
     const std::array<std::uintptr_t, 2> targets{registration.address, mirror.address};
     g_context.mirror_record_size = mirror.candidate->values.at("recordSize");
@@ -1835,9 +2338,139 @@ public:
     }
 };
 
+#include "blueprint_editor_runtime.hpp"
+
+// These native leaves are called directly by Blueprint VM instructions, which
+// do not pass through UObject::ProcessEvent. Filter the source instance here;
+// shared scripts, CDOs, FText arrays and global audio state remain engine-owned.
+enum class StoryAudioKind { Music, Dialogue };
+
+bool SuppressStoryAudio(std::uintptr_t source, StoryAudioKind kind) {
+    if (source == 0) return false;
+    if (g_birth_thread.load(std::memory_order_acquire) == GetCurrentThreadId()) {
+        auto* birth = g_birth_initialization;
+        const bool mute_birth = birth != nullptr && (kind == StoryAudioKind::Music
+            ? birth->mute_boss_music : birth->mute_boss_dialogue);
+        if (mute_birth && source == birth->story_audio_actor)
+            return true;
+        if (mute_birth && birth->story_audio_actor == 0) {
+            std::uintptr_t actor_class{};
+            std::uint32_t flags{};
+            if (ReadValue(source + g_layout.objectClass, &actor_class) &&
+                actor_class == birth->actor_class &&
+                ReadValue(source + g_layout.objectFlags, &flags) && (flags & 0x30U) == 0) {
+                birth->story_audio_actor = source;
+                return true;
+            }
+        }
+    }
+    AnomalyGenerationHandleV1 expected{};
+    {
+        std::scoped_lock lock(g_context.mutex);
+        for (std::size_t i = 0; i < g_context.records.size(); ++i) {
+            const auto& record = g_context.records[i];
+            const bool mute = kind == StoryAudioKind::Music
+                ? record.mute_boss_music : record.mute_boss_dialogue;
+            if (record.pointer == source && mute) {
+                expected = record.handle;
+                break;
+            }
+        }
+    }
+    // A destroyed actor's memory/index can be reused before the next refresh.
+    AnomalyGenerationHandleV1 actual{};
+    return expected.id != 0 && HandleFromPointer(source, &actual) &&
+        actual.id == expected.id && actual.generation == expected.generation;
+}
+
+class StoryAudioLease {
+public:
+    explicit StoryAudioLease(std::size_t index) : hooks_(g_context.hooks) {
+        if (hooks_ != nullptr && g_context.story_audio_hooks[index].handle.id != 0)
+            active_ = hooks_->begin_callback(hooks_->user,
+                g_context.story_audio_hooks[index].handle, &lease_).code == ANOMALY_STATUS_V1_OK;
+    }
+    ~StoryAudioLease() noexcept {
+        if (active_) {
+            try { static_cast<void>(hooks_->end_callback(hooks_->user, lease_)); }
+            catch (...) {}
+        }
+    }
+    explicit operator bool() const noexcept { return active_; }
+private:
+    const AnomalyHookServiceV1* hooks_{};
+    AnomalyGenerationHandleV1 lease_{};
+    bool active_{};
+};
+
+// Fixed native call ABIs: SpawnBossMusicVolume(), ShowMulVoiceMsg(context,
+// type, const TArray<FText>&), ShowDebugMulVoiceMsg(context, const TArray<...>&),
+// ShowVoiceMsg(context, type, const FText&). No ownership crosses these calls.
+template <std::size_t Index, typename... Args>
+void ANOMALY_CALL StoryAudioDetour(std::uintptr_t source, Args... args) noexcept {
+    using Function = void (ANOMALY_CALL*)(std::uintptr_t, Args...);
+    const auto original = reinterpret_cast<Function>(g_context.story_audio_hooks[Index].original);
+    try {
+        StoryAudioLease lease(Index);
+        bool suppress{};
+        try { suppress = lease && SuppressStoryAudio(source,
+            Index == 0 ? StoryAudioKind::Music : StoryAudioKind::Dialogue); }
+        catch (...) {}
+        if (!suppress && original != nullptr) original(source, args...);
+    } catch (...) {}
+}
+
+AnomalyStatusV1 ReleaseStoryAudioHooks() {
+    g_context.story_audio_ready.store(false, std::memory_order_release);
+    for (std::size_t i = g_context.story_audio_hooks.size(); i != 0; --i) {
+        auto& hook = g_context.story_audio_hooks[i - 1];
+        if (g_context.hooks != nullptr && hook.handle.id != 0) {
+            const auto status = g_context.hooks->release(g_context.hooks->user, hook.handle);
+            if (status.code != ANOMALY_STATUS_V1_OK && status.code != ANOMALY_STATUS_V1_NOT_FOUND)
+                return status;
+        }
+        hook = {};
+    }
+    return anomaly::sdk::Ok();
+}
+
+bool InstallStoryAudioHooks(const anomaly::sdk::Profile& profile) {
+    if (g_context.hooks == nullptr) return false;
+    constexpr std::array<const char*, 4> names{
+        "story-boss-music", "story-multiple-voices", "story-debug-voices", "story-single-voice"};
+    const std::array<void*, 4> detours{
+        reinterpret_cast<void*>(&StoryAudioDetour<0>),
+        reinterpret_cast<void*>(&StoryAudioDetour<1, std::uint8_t, const void*>),
+        reinterpret_cast<void*>(&StoryAudioDetour<2, const void*>),
+        reinterpret_cast<void*>(&StoryAudioDetour<3, std::uint8_t, const void*>)};
+    std::array<std::uintptr_t, names.size()> targets{};
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        const auto resolved = g_profile_scans.Resolve(g_context.core, profile, names[i]);
+        if (!resolved) return false;
+        targets[i] = resolved.address;
+    }
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        AnomalyHookRequestV1 request{sizeof(request)};
+        request.kind = ANOMALY_HOOK_V1_FUNCTION;
+        request.target = targets[i];
+        request.detour = detours[i];
+        request.label = anomaly::sdk::StringView(names[i]);
+        auto& hook = g_context.story_audio_hooks[i];
+        if (g_context.hooks->create(g_context.hooks->user, &request,
+                &hook.original, &hook.handle).code != ANOMALY_STATUS_V1_OK ||
+            hook.handle.id == 0 || hook.original == 0) {
+            static_cast<void>(ReleaseStoryAudioHooks());
+            return false;
+        }
+    }
+    g_context.story_audio_ready.store(true, std::memory_order_release);
+    return true;
+}
+
+
 bool DismissSummoned(AnomalyGenerationHandleV1 handle, std::uintptr_t pointer,
                      float previous_max_hp = 0.0F);
-void RefreshHealth();
+void RefreshHealth(bool refresh_attributes = true);
 
 // ---------------------------------------------------------------- 召唤
 
@@ -1852,6 +2485,8 @@ struct SummonResult {
     SummonIdentity registration;
     std::string server_combat_source;
     std::vector<AttributeValue> attributes;
+    std::shared_ptr<summon_lab::EditorRuntime> editor;
+    std::string editor_warning;
     char label[96]{};
     char detail[kTextCapacity]{};
 };
@@ -1900,15 +2535,8 @@ std::string MonsterConfigName(std::string_view path) {
     path = path.substr(0, path.find_first_of(":' \t\r\n"));
     const auto separator = path.find_last_of("/.");
     auto name = path.substr(separator + 1);
-    const auto starts_with = [](std::string_view value, std::string_view prefix) {
-        return value.size() >= prefix.size() &&
-            _strnicmp(value.data(), prefix.data(), prefix.size()) == 0;
-    };
-    // FinalTower bosses inherit BossCharacterBase but live under Maps_4N.
-    // Their FT-prefixed config IDs belong to the scene's own monster table.
-    if (!starts_with(path, "/Game/Blueprints/Character/Monster/") &&
-        !starts_with(path, "/Game/Maps_4N/Blueprints/Character/Monster/") &&
-        !starts_with(name, "Boss_") && !starts_with(name, "mon_")) return {};
+    // NPCs in the HTAICharacter catalog use the same generated-class identity.
+    // Their lack of a monster row is a preflight hint, never a naming filter.
     if (name.size() >= 2 && _strnicmp(name.data() + name.size() - 2, "_C", 2) == 0)
         name.remove_suffix(2);
     return std::string(name);
@@ -1937,21 +2565,13 @@ bool MakeConfigName(std::string_view config_name, std::uint64_t* result) {
     return true;
 }
 
-std::uintptr_t ResolveMonsterLevelQuery(
-    const anomaly::sdk::Host& query, const anomaly::sdk::Profile& profile) {
-    const auto signature = query.Query<AnomalySignatureServiceV1>(
-        ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION);
+std::uintptr_t ResolveMonsterLevelQuery(const anomaly::sdk::Profile& profile) {
     // Read-only query taking HTPlayerState*, UWorld* and an eight-byte FName.
-    return anomaly::sdk::ResolveProfileSymbol(
-        signature.get(), g_context.core, profile, "monster-default-level").address;
+    return g_profile_scans.Resolve(g_context.core, profile, "monster-default-level").address;
 }
 
-std::uint32_t ResolveDuelChaseRange(const anomaly::sdk::Host& query,
-                                    const anomaly::sdk::Profile& profile) {
-    const auto signature = query.Query<AnomalySignatureServiceV1>(
-        ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION);
-    const auto resolved = anomaly::sdk::ResolveProfileSymbol(
-        signature.get(), g_context.core, profile, "duel-current-chase-range");
+std::uint32_t ResolveDuelChaseRange(const anomaly::sdk::Profile& profile) {
+    const auto resolved = g_profile_scans.Resolve(g_context.core, profile, "duel-current-chase-range");
     if (!resolved) return 0;
     try {
         const auto offset = resolved.candidate->values.at("currentChaseRange");
@@ -1996,19 +2616,33 @@ public:
     }
 };
 
-std::uintptr_t FindLocalCombatConfig(std::uint64_t name, bool pack) {
+struct LocalCombatConfigLookup {
+    std::uintptr_t value{};
+    std::uint64_t row_alias{};
+};
+
+LocalCombatConfigLookup FindLocalCombatConfig(std::uint64_t name, bool pack) {
     const auto matches = [&](const CombatConfigSource& config) {
         return name != 0 && name == (pack ? config.pack : config.config);
     };
+    const auto select = [pack](const CombatConfigSource& config) {
+        return LocalCombatConfigLookup{pack ? config.property_pack : config.row,
+            pack ? 0 : config.row_alias};
+    };
     if (g_config_thread.load(std::memory_order_acquire) == GetCurrentThreadId() &&
         g_scoped_config != nullptr && matches(*g_scoped_config))
-        return pack ? g_scoped_config->property_pack : g_scoped_config->row;
+        return select(*g_scoped_config);
     std::scoped_lock lock(g_local_birth_mutex);
     for (const auto& binding : g_local_births) {
-        if (matches(binding.combat_config))
-            return pack ? binding.combat_config.property_pack : binding.combat_config.row;
+        // Aliased births retain their donor ID on the individual actor. Only
+        // FT needs a persistent scene fallback; different donors must not leak
+        // into other actors of the same base class.
+        const auto& config = binding.combat_config;
+        if ((pack || config.row_alias == 0) && matches(config)) return select(config);
+        if (!pack && config.row_alias != 0 && name == config.row_alias && config.row != 0)
+            return {config.row, 0};
     }
-    return 0;
+    return {};
 }
 
 using MonsterRowFn = std::uintptr_t (ANOMALY_CALL*)(std::uintptr_t, std::uint64_t);
@@ -2018,8 +2652,16 @@ std::uintptr_t ANOMALY_CALL FinalTowerMonsterRow(std::uintptr_t scene, std::uint
     try {
         LocalCombatLease lease(2);
         const auto original = reinterpret_cast<MonsterRowFn>(g_context.local_combat_hooks[2].original);
-        const auto row = original != nullptr ? original(scene, name) : 0;
-        return row != 0 || !lease ? row : FindLocalCombatConfig(name, false);
+        if (original == nullptr) return 0;
+        const auto configured = lease ? FindLocalCombatConfig(name, false) : LocalCombatConfigLookup{};
+        // Resolve the donor in this scene, through the original query. Do not
+        // cache a scene-owned row or recursively alias unrelated monsters.
+        if (configured.row_alias != 0) {
+            const auto row = original(scene, configured.row_alias);
+            return row != 0 ? row : configured.value;
+        }
+        const auto row = original(scene, name);
+        return row != 0 ? row : configured.value;
     } catch (...) { return 0; }
 }
 
@@ -2029,7 +2671,7 @@ std::uintptr_t ANOMALY_CALL FinalTowerPropertyPack(std::uintptr_t data, std::uin
         LocalCombatLease lease(3);
         const auto original = reinterpret_cast<PropertyPackFn>(g_context.local_combat_hooks[3].original);
         const auto pack = original != nullptr ? original(data, name, kind, context) : 0;
-        return pack != 0 || kind != 1 || !lease ? pack : FindLocalCombatConfig(name, true);
+        return pack != 0 || kind != 1 || !lease ? pack : FindLocalCombatConfig(name, true).value;
     } catch (...) { return 0; }
 }
 
@@ -2146,10 +2788,22 @@ CombatConfigSource PrepareFinalTowerConfig(std::string_view config_name) {
     return source;
 }
 
-bool InstallFinalTowerHooks(const anomaly::sdk::Host& host, const anomaly::sdk::Profile& profile) {
-    const auto signature = host.Query<AnomalySignatureServiceV1>(
-        ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION);
-    if (!signature || g_context.hooks == nullptr) return false;
+CombatConfigSource PrepareCombatConfig(std::string_view config_name, std::string_view source_blueprint) {
+    if (source_blueprint.empty()) return PrepareFinalTowerConfig(config_name);
+    if (!g_final_tower.ready) return {};
+    const auto donor = MonsterConfigName(source_blueprint);
+    if (donor.empty()) return {};
+    auto source = PrepareFinalTowerConfig(donor);
+    source.config_name = config_name;
+    source.server_blueprint = source_blueprint;
+    if (source.row_name.empty()) source.row_name = donor;
+    if (!MakeConfigName(source.config_name, &source.config) ||
+        !MakeConfigName(donor, &source.row_alias)) return {};
+    return source;
+}
+
+bool InstallFinalTowerHooks(const anomaly::sdk::Profile& profile) {
+    if (g_context.hooks == nullptr) return false;
     try {
         const auto& layout = profile.layout;
         const auto count_offset = layout.at("objectArrayCount");
@@ -2171,7 +2825,7 @@ bool InstallFinalTowerHooks(const anomaly::sdk::Host& host, const anomaly::sdk::
         std::array<std::uintptr_t, 5> addresses{};
         std::uint32_t displacement_offset{}, instruction_size{};
         for (std::size_t i = 0; i < names.size(); ++i) {
-            const auto resolved = anomaly::sdk::ResolveProfileSymbol(signature.get(), g_context.core, profile, names[i]);
+            const auto resolved = g_profile_scans.Resolve(g_context.core, profile, names[i]);
             if (!resolved) return false;
             addresses[i] = resolved.address;
             if (i == 4) {
@@ -2243,13 +2897,16 @@ bool ResolveSummonLevel(AnomalyGenerationHandleV1 pawn, std::string_view path,
 }
 
 BlueprintConfigState CheckBlueprintConfig(std::string_view path, CombatConfigSource* source = nullptr,
-                                         AnomalyGenerationHandleV1 pawn = {}, float* default_hp = nullptr) {
+                                         AnomalyGenerationHandleV1 pawn = {}, float* default_hp = nullptr,
+                                         std::string_view source_blueprint = {}) {
     if (default_hp != nullptr) *default_hp = 0.0F;
     const auto config_name = MonsterConfigName(path);
     if (config_name.empty()) return BlueprintConfigState::NotApplicable;
 
-    const auto prepared = PrepareFinalTowerConfig(config_name);
+    const auto prepared = PrepareCombatConfig(config_name, source_blueprint);
     if (source != nullptr) *source = prepared;
+    if (!source_blueprint.empty() && prepared.row_alias == 0)
+        return BlueprintConfigState::Unavailable;
     CombatConfigScope config_scope(prepared);
     AnomalyGenerationHandleV1 ht_util{};
     std::uint64_t config{};
@@ -2287,29 +2944,84 @@ BlueprintConfigState CheckBlueprintConfig(std::string_view path, CombatConfigSou
 }
 
 void UpdateBlueprintConfig(double delta_seconds) {
-    std::string path;
+    BlueprintConfigCheck check;
     {
         std::scoped_lock lock(g_context.mutex);
-        auto& check = g_context.blueprint_config;
-        if (check.path != g_context.class_path.data()) {
-            check = {g_context.class_path.data(), BlueprintConfigState::Pending};
+        auto& current = g_context.blueprint_config;
+        if (current.path != g_context.class_path.data() ||
+            current.requested_source != g_context.combat_config_blueprint) {
+            current = {g_context.class_path.data(), BlueprintConfigState::Pending};
+            current.requested_source = g_context.combat_config_blueprint;
             // Do not create FNames for every intermediate keystroke.
             g_context.blueprint_check_delay = 0.25;
             return;
         }
-        if (check.state != BlueprintConfigState::Pending || check.path.empty()) return;
+        if (current.stage == BlueprintConfigStage::Complete || current.path.empty()) return;
         g_context.blueprint_check_delay -= delta_seconds;
         if (g_context.blueprint_check_delay > 0) return;
+        check = current;
+    }
+    const auto requested = check.requested_source;
+    // At most one native health query per update. Candidates come from the
+    // cached Asset Registry catalog; checking them does not load blueprints.
+    switch (check.stage) {
+    case BlueprintConfigStage::Native: {
+        CombatConfigSource source;
+        check.state = CheckBlueprintConfig(check.path, &source);
+        check.source = source.row_name;
+        check.stage = check.requested_source.empty()
+            ? BlueprintConfigStage::Complete : BlueprintConfigStage::Borrowed;
+        if (check.state == BlueprintConfigState::NoHealth) {
+            std::scoped_lock lock(g_context.mutex);
+            for (const auto& entry : g_context.catalog)
+                if (summon_lab::IsCombatConfigCandidate(check.path, entry.path))
+                    check.candidates.push_back(entry.path);
+            check.stage = BlueprintConfigStage::Candidates;
+        }
+        break;
+    }
+    case BlueprintConfigStage::Candidates:
+        if (check.next_candidate < check.candidates.size()) {
+            const auto& candidate = check.candidates[check.next_candidate++];
+            float hp{};
+            if (CheckBlueprintConfig(candidate, nullptr, {}, &hp) == BlueprintConfigState::Available)
+                check.sources.push_back({candidate, hp});
+        }
+        if (check.next_candidate == check.candidates.size())
+            check.stage = check.requested_source.empty()
+                ? BlueprintConfigStage::Complete : BlueprintConfigStage::Borrowed;
+        break;
+    case BlueprintConfigStage::Borrowed: {
+        CombatConfigSource source;
+        check.state = CheckBlueprintConfig(check.path, &source, {}, nullptr, check.requested_source);
+        check.source = source.row_name;
+        check.stage = BlueprintConfigStage::Complete;
+        break;
+    }
+    case BlueprintConfigStage::Complete:
+        break;
+    }
+    std::scoped_lock lock(g_context.mutex);
+    if (check.path == g_context.class_path.data() && requested == g_context.combat_config_blueprint)
+        g_context.blueprint_config = std::move(check);
+}
+
+void UpdateAdvancedConfig() {
+    std::string path;
+    {
+        std::scoped_lock lock(g_context.mutex);
+        if (!g_context.advanced_combat_source || g_context.advanced_combat_blueprint.empty()) return;
+        auto& check = g_context.advanced_config;
+        if (check.path != g_context.advanced_combat_blueprint)
+            check = {g_context.advanced_combat_blueprint};
+        if (check.state != BlueprintConfigState::Pending) return;
         path = check.path;
     }
-    CombatConfigSource source;
-    const auto state = CheckBlueprintConfig(path, &source);
+    float hp{};
+    const auto state = CheckBlueprintConfig(path, nullptr, {}, &hp);
     std::scoped_lock lock(g_context.mutex);
-    // A render callback may have selected another blueprint during the query.
-    if (path == g_context.class_path.data()) {
-        g_context.blueprint_config.state = state;
-        g_context.blueprint_config.source = source.row_name;
-    }
+    if (path == g_context.advanced_combat_blueprint)
+        g_context.advanced_config = {path, state, hp};
 }
 
 std::string BirthPresetError(const std::array<BirthPreset, kBirthAttributeNames.size()>& presets) {
@@ -2351,22 +3063,61 @@ std::uintptr_t LoadServerCombatCdo(AnomalyGenerationHandleV1 library, const std:
         cdo == 0 || !ReadValue(cdo + g_layout.objectClass, &cdo_class) || cdo_class != uclass ||
         !ReadValue(cdo + g_layout.objectFlags, &flags) || (flags & 0x10U) == 0 ||
         !HandleFromPointer(cdo, &handle)) return 0;
-    return cdo;
+    // The native registration accepts AI character defaults. Advanced sources
+    // may come from a different family, but cannot be arbitrary UObject CDOs.
+    AnomalyGenerationHandleV1 ai_class{};
+    if (!FindHandle("/Script/HTGame.HTAICharacter", &ai_class)) return 0;
+    auto type = uclass;
+    for (int depth = 0; depth < 64 && type != 0; ++depth) {
+        AnomalyGenerationHandleV1 current{};
+        if (!HandleFromPointer(type, &current)) return 0;
+        if (current.id == ai_class.id && current.generation == ai_class.generation)
+            return cdo;
+        if (!ReadValue(type + g_layout.structSuper, &type)) return 0;
+    }
+    return 0;
 }
 
-summon_lab::Vector BatchSpawnOffset(const SummonSettings& settings, std::uint32_t index) {
+bool SetActorCombatConfig(AnomalyGenerationHandleV1 handle, std::uintptr_t actor, std::uint64_t config) {
+    if (!IsActorUsable(handle, actor)) return false;
+    std::uintptr_t type{}, field_class{};
+    std::uint32_t type_id{};
+    std::uint64_t property_name{};
+    std::int32_t offset{}, size{}, dimension{}, owner_size{};
+    char name[64]{};
+    if (!ReadValue(actor + g_layout.objectClass, &type)) return false;
+    const auto property = FindProperty(type, "m_CharacterConfigID");
+    if (property == 0 || !ReadValue(property + g_layout.fieldClass, &field_class) ||
+        !ReadValue(field_class + g_layout.fieldClassName, &type_id) || !ResolveName(type_id, name, sizeof(name)) ||
+        std::strcmp(name, "NameProperty") != 0 ||
+        !ReadValue(property + g_layout.propertyElementSize, &size) || size != sizeof(config) ||
+        !ReadValue(property + g_layout.propertyArrayDim, &dimension) || dimension != 1 ||
+        !ReadValue(property + g_layout.propertyOffset, &offset) || offset < 0 ||
+        !ReadValue(type + g_layout.structSize, &owner_size) ||
+        offset > owner_size || size > owner_size - offset ||
+        !ReadValue(property + g_layout.fieldName, &property_name)) return false;
+    AnomalyGenerationHandleV1 library{};
+    summon_lab::NameProperty params{actor, property_name, config};
+    std::uint64_t actual{};
+    return FindHandle("/Script/Engine.Default__KismetSystemLibrary", &library) &&
+        InvokeByPath(library, "/Script/Engine.KismetSystemLibrary:SetNamePropertyByName", &params, sizeof(params)) &&
+        ReadValue(actor + offset, &actual) && actual == config;
+}
+
+summon_lab::Vector BatchSpawnOffset(const SummonSettings& settings, std::uint64_t index) {
     if (settings.count == 1) return {};
     // Expand a square grid around the first cell. A wall in front must not
     // send every later attempt farther into that same wall.
-    const auto ring = static_cast<std::int32_t>(std::ceil((std::sqrt(index + 1.0) - 1.0) * 0.5));
+    const auto ring = static_cast<std::int64_t>(std::ceil((std::sqrt(static_cast<double>(index) + 1.0) - 1.0) * 0.5));
     const auto side = 2 * ring;
-    auto remaining = (side + 1) * (side + 1) - 1 - static_cast<std::int32_t>(index);
-    std::int32_t x = ring, y = -ring;
+    auto remaining = (side + 1) * (side + 1) - 1 - static_cast<std::int64_t>(index);
+    std::int64_t x = ring, y = -ring;
     if (remaining < side) x -= remaining;
     else if ((remaining -= side) < side) { x = -ring; y += remaining; }
     else if ((remaining -= side) < side) { x = -ring + remaining; y = ring; }
     else { remaining -= side; y = ring - remaining; }
-    return {(1.0 + x) * settings.spacing * 100.0, y * settings.spacing * 100.0, 0.0};
+    return {(1.0 + static_cast<double>(x)) * settings.spacing * 100.0,
+        static_cast<double>(y) * settings.spacing * 100.0, 0.0};
 }
 
 bool CaptureBatchOrigin(AnomalyGenerationHandleV1 pawn, SummonBatch& batch) {
@@ -2381,7 +3132,7 @@ bool CaptureBatchOrigin(AnomalyGenerationHandleV1 pawn, SummonBatch& batch) {
     std::vector<AnomalyGenerationHandleV1> handles;
     {
         std::scoped_lock lock(g_context.mutex);
-        for (std::size_t i = 0; i < g_context.record_count; ++i)
+        for (std::size_t i = 0; i < g_context.records.size(); ++i)
             handles.push_back(g_context.records[i].handle);
     }
     for (const auto handle : handles) {
@@ -2445,17 +3196,23 @@ bool FinishBatchPlacement(AnomalyGenerationHandleV1 actor, SummonBatch& batch,
     return false;
 }
 
+#include "cutscenes.hpp"
+
 SummonResult SummonOne(SummonBatch& batch) {
     SummonResult result;
     const auto& settings = batch.settings;
-    {
-        std::scoped_lock lock(g_context.mutex);
-        if (g_context.record_count >= kMaxRecords) {
-            std::snprintf(result.detail, sizeof(result.detail), "summon: record limit reached");
-            return result;
-        }
+    if (settings.skip_cutscenes && !g_cutscenes.ready.load(std::memory_order_acquire)) {
+        const auto message = g_context.localizer.Text("summon.cutscenes_unavailable", "Cutscene control unavailable");
+        std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
+        return result;
     }
-
+    if ((settings.mute_boss_music || settings.mute_boss_dialogue) &&
+        !g_context.story_audio_ready.load(std::memory_order_acquire)) {
+        const auto message = g_context.localizer.Text("summon.story_audio_unavailable",
+            "Boss music and dialogue control unavailable");
+        std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
+        return result;
+    }
     AnomalyGenerationHandleV1 pawn{};
     if (!FindLocalPawn(&pawn)) {
         std::snprintf(result.detail, sizeof(result.detail), "summon: no local pawn");
@@ -2484,32 +3241,43 @@ SummonResult SummonOne(SummonBatch& batch) {
         return result;
     }
 
-    const auto& server_combat_blueprint = settings.server_combat_blueprint;
-    const bool compatibility = settings.compatibility;
+    const auto selected_source = summon_lab::SelectedCombatBlueprint(settings);
+    const bool advanced_source = settings.advanced_combat_source && !settings.advanced_combat_blueprint.empty();
+    const bool compatibility = settings.compatibility && !advanced_source;
     auto presets = settings.presets;
 
     CombatConfigSource combat_config;
-    const auto config_state = CheckBlueprintConfig(path, &combat_config, pawn);
-    if (config_state == BlueprintConfigState::NoHealth) {
-        const auto message = g_context.localizer.Text("summon.config_missing",
-            "Combat config missing in this scene; HP overrides cannot initialize it");
+    if (!advanced_source && !selected_source.empty() &&
+        !summon_lab::IsCombatConfigCandidate(path, selected_source)) {
+        const auto message = g_context.localizer.Text("summon.config_source_invalid", "Choose a combat config from this blueprint's variants");
         std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
         return result;
     }
-    if (compatibility) {
+    // Preflight is advisory. NPCs and other noncombat blueprints can legitimately
+    // have no monster row; the spawn must not depend on a positive HP lookup.
+    combat_config = PrepareCombatConfig(MonsterConfigName(path), selected_source);
+    if (!selected_source.empty() && combat_config.row_alias == 0) {
+        const auto message = g_context.localizer.Text("summon.compat_source_unavailable",
+            "Server combat source unavailable in this scene");
+        std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
+        return result;
+    }
+    const auto& server_combat_blueprint = compatibility
+        ? settings.server_combat_blueprint : combat_config.server_blueprint;
+    if (compatibility || !server_combat_blueprint.empty()) {
         float source_hp{};
-        if (server_combat_blueprint.empty() || g_layout.classDefaultObject == 0 ||
+        if (compatibility && (server_combat_blueprint.empty() ||
             MonsterConfigName(server_combat_blueprint).starts_with("FT_") ||
             CheckBlueprintConfig(server_combat_blueprint, nullptr, pawn, &source_hp) !=
-                BlueprintConfigState::Available) {
+                BlueprintConfigState::Available)) {
             const auto message = g_context.localizer.Text("summon.compat_source_unavailable",
                 "Server combat source unavailable in this scene");
             std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
             return result;
         }
         auto& hp = presets[kMaxHpAttribute];
-        if (!hp.enabled) hp = {1, source_hp};
-        if (hp.value > source_hp) {
+        if (compatibility && !hp.enabled) hp = {1, source_hp};
+        if (compatibility && hp.value > source_hp) {
             char capacity[48]{};
             std::snprintf(capacity, sizeof(capacity), "%.9g", source_hp);
             const std::array<std::string_view, 1> args{capacity};
@@ -2522,14 +3290,12 @@ SummonResult SummonOne(SummonBatch& batch) {
     }
     CombatConfigScope config_scope(combat_config);
     std::int32_t ai_level{};
-    if (!ResolveSummonLevel(pawn, path, settings.level, &ai_level)) {
-        const auto message = g_context.localizer.Text("summon.level_unavailable",
-            "Default level unavailable; enter a level");
-        std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
-        return result;
-    }
+    if (!ResolveSummonLevel(pawn, path, settings.level, &ai_level)) ai_level = 0;
 
     BirthInitialization birth;
+    birth.mute_boss_music = settings.mute_boss_music;
+    birth.mute_boss_dialogue = settings.mute_boss_dialogue;
+    birth.skip_cutscenes = settings.skip_cutscenes;
     const auto preset_error = BirthPresetError(presets);
     if (!preset_error.empty()) {
         std::snprintf(result.detail, sizeof(result.detail), "%s", preset_error.c_str());
@@ -2568,7 +3334,14 @@ SummonResult SummonOne(SummonBatch& batch) {
             return result;
         }
     }
-    if (compatibility) {
+    if (!ResolveEditorFields(birth.actor_class, settings.editor, birth.editor_fields) ||
+        (!birth.editor_fields.empty() && g_context.editor.birth_observer.id == 0) ||
+        !PrepareEditorRules(settings.editor, result.editor)) {
+        const auto message = g_context.localizer.Text("editor.prepare_failed", "Editor settings could not be resolved");
+        std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
+        return result;
+    }
+    if (!server_combat_blueprint.empty()) {
         birth.registration_cdo = LoadServerCombatCdo(lib_cdo, server_combat_blueprint);
         if (birth.registration_cdo == 0) {
             const auto message = g_context.localizer.Text("summon.compat_source_unavailable",
@@ -2593,8 +3366,8 @@ SummonResult SummonOne(SummonBatch& batch) {
     bool summoned{};
     {
         // SummonAI itself defers construction, configures level/leader/camp,
-        // then finishes spawning. GAS receives our inputs inside that call;
-        // no actor attributes or HP caches are patched after it returns.
+        // then finishes spawning. GAS receives custom base attributes inside
+        // that call; the native registration is configured after ownership.
         BirthScope scope(birth);
         summoned = InvokeByPath(pawn, kPathSummonAI, &parms, sizeof(parms));
     }
@@ -2622,11 +3395,8 @@ SummonResult SummonOne(SummonBatch& batch) {
     }
     result.handle = ai_handle;
     result.pointer = ai_pointer;
-    if (result.registration.controller.id == 0 || result.registration.index < 0) {
-        static_cast<void>(InvokeByPath(ai_handle, kPathDestroyActor, nullptr, 0));
-        std::snprintf(result.detail, sizeof(result.detail), "summon: native registration unresolved");
-        return result;
-    }
+    if (!birth.editor_fields.empty() && (!birth.editor_applied || birth.editor_actor != ai_pointer))
+        result.editor_warning = g_context.localizer.Text("editor.birth_failed", "Field overrides were not applied before BeginPlay");
     if (birth.registration_cdo != 0 && !birth.registration_substituted) {
         static_cast<void>(InvokeByPath(ai_handle, kPathDestroyActor, nullptr, 0));
         const auto message = g_context.localizer.Text("summon.compat_registration_failed",
@@ -2635,14 +3405,8 @@ SummonResult SummonOne(SummonBatch& batch) {
         return result;
     }
 
-    if (!ResolveActorAttributeSet(ai_pointer, &result.ability_system, &result.attribute_set) ||
-        result.ability_system == 0) {
-        static_cast<void>(InvokeByPath(ai_handle, kPathDestroyActor, nullptr, 0));
-        std::snprintf(result.detail, sizeof(result.detail), "summon: local combat attributes unresolved");
-        return result;
-    }
-    RegisterLocalBirth(ai_handle, ai_pointer, result.ability_system,
-                       result.attribute_set, birth.exact_hp, combat_config, result.registration);
+    const bool attributes_resolved = ResolveActorAttributeSet(ai_pointer, &result.ability_system,
+        &result.attribute_set) && result.ability_system != 0;
 
     // 未登记进召唤列表的 AI 没有归属，敌对化之后会在 AI tick 触发访问违例
     {
@@ -2652,6 +3416,15 @@ SummonResult SummonOne(SummonBatch& batch) {
                           "summon: AddSummonedAI failed");
             return result;
         }
+    }
+
+    // Preserve the chosen source on this instance so later native lookups use
+    // its donor even when another instance of the same class uses a different one.
+    if (combat_config.row_alias != 0 && !SetActorCombatConfig(ai_handle, ai_pointer, combat_config.row_alias)) {
+        static_cast<void>(DismissSummoned(ai_handle, ai_pointer));
+        const auto message = g_context.localizer.Text("summon.config_source_failed", "Combat config could not be applied; summon removed");
+        std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
+        return result;
     }
 
     if (settings.ignore_player) {
@@ -2702,16 +3475,40 @@ SummonResult SummonOne(SummonBatch& batch) {
     result.pet = settings.pet;
     float initial_hp{}, initial_max{};
     if (!ReadHealth(ai_handle, &initial_hp, &initial_max) || !std::isfinite(initial_hp) ||
-        !std::isfinite(initial_max) || initial_hp <= 0 || initial_max <= 0) {
+        !std::isfinite(initial_max)) {
         static_cast<void>(DismissSummoned(ai_handle, ai_pointer));
         const auto message = g_context.localizer.Text("summon.health_uninitialized",
             "Combat health was not initialized; summon removed");
         std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
         return result;
     }
+    const bool registered = result.registration.controller.id != 0 && result.registration.index >= 0;
+    // A real combat entity needs a native identity and an ability system.
+    // An entity born at 0/0 can still be managed and removed without either.
+    if (initial_max > 0.0F && (!registered || !attributes_resolved)) {
+        static_cast<void>(DismissSummoned(ai_handle, ai_pointer));
+        std::snprintf(result.detail, sizeof(result.detail), "summon: native combat initialization unresolved");
+        return result;
+    }
+    // These unconfigured base classes can inherit a scripted partial-health
+    // birth. Complete the new instance through the native setter after spawn
+    // and ownership registration, before validating custom HP or exposing it.
+    // This runs once; later damage and native health replies remain untouched.
+    if (combat_config.row_alias != 0 && initial_hp > 0.0F && initial_hp < initial_max) {
+        summon_lab::SetHealth health{initial_max};
+        if (!InvokeByPath(ai_handle, "/Script/HTGame.HTAbilityCharacter:SetHP", &health, sizeof(health)) ||
+            !ReadMatchingHealth(ai_handle, initial_max, &initial_hp, &initial_max)) {
+            static_cast<void>(DismissSummoned(ai_handle, ai_pointer));
+            const auto message = g_context.localizer.Text("summon.health_uninitialized",
+                "Combat health was not initialized; summon removed");
+            std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
+            return result;
+        }
+    }
     result.hp = initial_hp;
     result.max_hp = initial_max;
     bool birth_ok = true;
+    float applied_hp{};
     if (!birth.attributes.empty()) {
         birth_ok = birth.actor == ai_pointer && birth.attribute_set == result.attribute_set &&
                    result.attribute_set != 0;
@@ -2721,22 +3518,24 @@ SummonResult SummonOne(SummonBatch& batch) {
                 [&](const AttributeValue& value) { return value.name == preset.name; });
             birth_ok = birth_ok && preset.applied && found != result.attributes.end() &&
                        HealthMatches(found->base, preset.value);
+            if (preset.name == "HPMaxBase" && preset.applied && found != result.attributes.end() &&
+                birth.actor == ai_pointer && birth.attribute_set == result.attribute_set &&
+                HealthMatches(found->base, preset.value) && HealthMatches(initial_max, birth.exact_hp))
+                applied_hp = birth.exact_hp;
         }
         if (birth.exact_hp > 0) {
             float hp{}, max_hp{};
             birth_ok = birth_ok && ReadMatchingHealth(ai_handle, birth.exact_hp, &hp, &max_hp);
         }
-    } else if (result.attribute_set != 0) {
+    } else if (result.attribute_set != 0 && batch.completed == 0) {
+        // The first member is selected automatically. Other members get their
+        // full attribute list when selected; birth overrides are always verified above.
         static_cast<void>(ReadAttributeValues(result.attribute_set, &result.attributes));
     }
-    if (!birth_ok) {
-        static_cast<void>(DismissSummoned(ai_handle, ai_pointer));
-        result.ok = false;
-        std::snprintf(result.detail, sizeof(result.detail),
-                      "summon rejected: birth attributes were not initialized; actor removed");
-        return result;
-    }
-    if (birth.registration_controller != 0) {
+    if (attributes_resolved)
+        RegisterLocalBirth(ai_handle, ai_pointer, result.ability_system,
+            result.attribute_set, applied_hp, combat_config, result.registration);
+    if (registered && initial_max > 0.0F) {
         // SummonAI registers the server ability data, but unlike the native
         // opponent-summoner path it does not configure the resulting camp.
         // Mirror that native second step using the actual finished actor's camp.
@@ -2745,10 +3544,10 @@ SummonResult SummonOne(SummonBatch& batch) {
         ConfigureSummon configuration{birth.registration_leader, birth.registration_index, 0, 1.0F};
         bool configured = ReadCamp(ai_pointer, &camp);
         configuration.camp = camp;
-        if (configured && birth.exact_hp > 0.0F) {
+        if (configured && applied_hp > 0.0F) {
             std::scoped_lock lock(g_local_birth_mutex);
             g_birth_configurations.push_back({ai_handle, controller, result.ability_system,
-                configuration, birth.exact_hp, 0.0F, false, birth.registration_substituted});
+                configuration, applied_hp, 0.0F, false, compatibility});
         } else {
             configured = configured && InvokeByPath(controller,
                 "/Script/HTGame.HTPlayerController:ServerConfigureSummonedAI_HybridMode",
@@ -2765,7 +3564,7 @@ SummonResult SummonOne(SummonBatch& batch) {
             std::snprintf(message, sizeof(message),
                 "SummonLab native-configuration: actor=%p index=%d camp=%u %s",
                 reinterpret_cast<void*>(ai_pointer), birth.registration_index, static_cast<unsigned>(camp),
-                birth.exact_hp > 0.0F ? "waiting for native maximum" : "initialHPPercent=1 submitted");
+                applied_hp > 0.0F ? "waiting for native maximum" : "initialHPPercent=1 submitted");
             g_context.core->log(g_context.core->user, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
                 anomaly::sdk::StringView(message));
         }
@@ -2773,7 +3572,7 @@ SummonResult SummonOne(SummonBatch& batch) {
     if (birth.registration_substituted && g_context.core != nullptr) {
         char message[kPathCapacity + 160]{};
         std::snprintf(message, sizeof(message),
-            "SummonLab FT-compatibility: actor=%p index=%d blueprint=%s serverSource=%s requestedHP=%.9g",
+            "SummonLab combat-source: actor=%p index=%d blueprint=%s serverSource=%s requestedHP=%.9g",
             reinterpret_cast<void*>(ai_pointer), birth.registration_index, path,
             result.server_combat_source.c_str(), birth.exact_hp);
         g_context.core->log(g_context.core->user, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
@@ -2786,7 +3585,12 @@ SummonResult SummonOne(SummonBatch& batch) {
     const bool named = SetSpawnDisplayName(ai_handle, ai_pointer, settings.display_name.c_str());
     std::snprintf(result.label, sizeof(result.label), "%s",
                   named && !settings.display_name.empty() ? settings.display_name.c_str() : name);
-    if (!named) {
+    if (!birth_ok || initial_max <= 0.0F) {
+        const auto message = !birth_ok
+            ? g_context.localizer.Text("summon.attributes_unapplied", "Summoned; some custom attributes were not applied")
+            : g_context.localizer.Text("summon.no_combat_health", "Summoned without combat health");
+        std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
+    } else if (!named) {
         const auto message = g_context.localizer.Text("summon.name_failed",
             "Summoned, but the name could not be set");
         std::snprintf(result.detail, sizeof(result.detail), "%s", message.c_str());
@@ -3122,7 +3926,7 @@ void ChangeBattle(const PendingOp& op, bool forgetting = false) {
     {
         std::scoped_lock lock(g_context.mutex);
         previous = g_context.battles;
-        for (std::size_t i = 0; i < g_context.record_count; ++i) {
+        for (std::size_t i = 0; i < g_context.records.size(); ++i) {
             const auto& record = g_context.records[i];
             DuelActor actor{record.id, record.handle, record.pointer, {}, record.pet, record.registration};
             actor.battle_tuned = record.battle_tuned;
@@ -3332,7 +4136,7 @@ void ExcludeNewSummon(const SummonResult& result) {
     std::vector<DuelActor> fighters;
     {
         std::scoped_lock lock(g_context.mutex);
-        for (std::size_t i = 0; i < g_context.record_count; ++i) {
+        for (std::size_t i = 0; i < g_context.records.size(); ++i) {
             const auto& record = g_context.records[i];
             if (g_context.battles.Contains(record.id))
                 fighters.push_back({record.id, record.handle, record.pointer});
@@ -3354,23 +4158,21 @@ void ForgetRecord(std::uint64_t record_id) {
     SummonIdentity registration;
     {
         std::scoped_lock lock(g_context.mutex);
-        for (std::size_t i = 0; i < g_context.record_count; ++i) {
+        for (std::size_t i = 0; i < g_context.records.size(); ++i) {
             if (g_context.records[i].id != record_id) continue;
             handle = g_context.records[i].handle;
             registration = g_context.records[i].registration;
-            for (std::size_t k = i + 1; k < g_context.record_count; ++k)
-                g_context.records[k - 1] = std::move(g_context.records[k]);
-            g_context.records[--g_context.record_count] = {};
+            g_context.records.erase(g_context.records.begin() + i);
             if (g_context.selected_record_id == record_id) {
                 g_context.selected_record_id = 0;
             }
             break;
         }
         const auto end = std::remove_if(g_context.pending.begin(),
-            g_context.pending.begin() + g_context.pending_count,
+            g_context.pending.begin() + g_context.pending.size(),
             [&](const PendingOp& op) { return op.record_id == record_id || op.target_id == record_id; });
-        g_context.pending_count = static_cast<std::size_t>(end - g_context.pending.begin());
-        g_pending_hint.store(static_cast<std::uint32_t>(g_context.pending_count),
+        g_context.pending.erase(end, g_context.pending.end());
+        g_pending_hint.store(static_cast<std::uint32_t>(g_context.pending.size()),
                              std::memory_order_release);
         for (auto& record : g_context.records) {
             if (record.aggro.priority_target == record_id) record.aggro.priority_target = 0;
@@ -3389,7 +4191,7 @@ void RemoveOne(std::uint64_t record_id) {
     float previous_max_hp{};
     {
         std::scoped_lock lock(g_context.mutex);
-        for (std::size_t i = 0; i < g_context.record_count; ++i) {
+        for (std::size_t i = 0; i < g_context.records.size(); ++i) {
             if (g_context.records[i].id != record_id) continue;
             handle = g_context.records[i].handle;
             pointer = g_context.records[i].pointer;
@@ -3406,16 +4208,12 @@ void RemoveOne(std::uint64_t record_id) {
 }
 
 void ClearAll() {
-    std::array<std::uint64_t, kMaxRecords> snapshot{};
-    std::size_t count{};
-    {
-        std::scoped_lock lock(g_context.mutex);
-        count = g_context.record_count;
-        for (std::size_t i = 0; i < count; ++i)
-            snapshot[i] = g_context.records[i].id;
-    }
-    for (std::size_t i = 0; i < count; ++i)
-        RemoveOne(snapshot[i]);
+    std::scoped_lock lock(g_context.mutex);
+    // Removal shares the Game update budget, even for an unlimited batch.
+    // Put these before later commands so ClearAll retains its queue ordering.
+    for (auto it = g_context.records.rbegin(); it != g_context.records.rend(); ++it)
+        g_context.pending.push_front(PendingOp{OpKind::Remove, it->id});
+    g_pending_hint.store(static_cast<std::uint32_t>(g_context.pending.size()), std::memory_order_release);
 }
 
 void SetActorOption(const PendingOp& op) {
@@ -3423,7 +4221,7 @@ void SetActorOption(const PendingOp& op) {
     std::uintptr_t pointer{};
     {
         std::scoped_lock lock(g_context.mutex);
-        for (std::size_t i = 0; i < g_context.record_count; ++i) {
+        for (std::size_t i = 0; i < g_context.records.size(); ++i) {
             if (g_context.records[i].id == op.record_id) {
                 handle = g_context.records[i].handle;
                 pointer = g_context.records[i].pointer;
@@ -3462,7 +4260,7 @@ void SetActorOption(const PendingOp& op) {
 }
 
 
-void RefreshHealth() {
+void RefreshHealth(bool refresh_attributes) {
 
     struct HealthTarget {
         std::uint64_t id{};
@@ -3470,18 +4268,19 @@ void RefreshHealth() {
         std::uintptr_t pointer{};
         float previous_max_hp{};
     };
-    HealthTarget snapshot[kMaxRecords]{};
+    std::vector<HealthTarget> snapshot;
     std::size_t count{};
     std::uint64_t selected_id{};
     {
         std::scoped_lock lock(g_context.mutex);
-        count = g_context.record_count;
+        count = g_context.records.size();
+        snapshot.resize(count);
         selected_id = g_context.selected_record_id;
-        for (std::size_t i = 0; i < count && i < kMaxRecords; ++i)
+        for (std::size_t i = 0; i < count; ++i)
             snapshot[i] = {g_context.records[i].id, g_context.records[i].handle,
                            g_context.records[i].pointer, g_context.records[i].max_hp};
     }
-    for (std::size_t i = 0; i < count && i < kMaxRecords; ++i) {
+    for (std::size_t i = 0; i < count; ++i) {
         if (!IsActorAlive(snapshot[i].handle, snapshot[i].pointer)) {
             ForgetRecord(snapshot[i].id);
             continue;
@@ -3495,11 +4294,11 @@ void RefreshHealth() {
         }
         std::vector<AttributeValue> attributes;
         std::uintptr_t ability_system{}, attribute_set{};
-        const bool attributes_read = snapshot[i].id == selected_id &&
+        const bool attributes_read = refresh_attributes && snapshot[i].id == selected_id &&
             ResolveActorAttributeSet(snapshot[i].pointer, &ability_system, &attribute_set) &&
             ReadAttributeValues(attribute_set, &attributes);
         std::scoped_lock lock(g_context.mutex);
-        for (std::size_t k = 0; k < g_context.record_count; ++k) {
+        for (std::size_t k = 0; k < g_context.records.size(); ++k) {
             auto& record = g_context.records[k];
             if (record.id != snapshot[i].id) continue;
             record.hp = hp;
@@ -3518,7 +4317,7 @@ bool MaintainBattles(const std::vector<std::uint64_t>& changed = {}) {
     {
         std::scoped_lock lock(g_context.mutex);
         graph = g_context.battles;
-        for (std::size_t i = 0; i < g_context.record_count; ++i) {
+        for (std::size_t i = 0; i < g_context.records.size(); ++i) {
             const auto& record = g_context.records[i];
             if ((!graph.Contains(record.id) && !record.battle_tuned) ||
                 record.hp <= 0 || record.max_hp <= 0) continue;
@@ -3612,7 +4411,7 @@ void ApplyAggroSettings(const PendingOp& op) {
     std::vector<std::uint64_t> changed;
     {
         std::scoped_lock lock(g_context.mutex);
-        for (std::size_t i = 0; i < g_context.record_count; ++i) {
+        for (std::size_t i = 0; i < g_context.records.size(); ++i) {
             auto& record = g_context.records[i];
             if (record.pet || record.hp <= 0 || record.max_hp <= 0 ||
                 std::find(op.members.begin(), op.members.end(), record.id) == op.members.end()) continue;
@@ -3636,39 +4435,26 @@ void CancelSummonsLocked() {
     if (!SummonBusyLocked()) return;
     g_context.summon_batch->stopped = true;
     const auto end = std::remove_if(g_context.pending.begin(),
-        g_context.pending.begin() + g_context.pending_count,
+        g_context.pending.begin() + g_context.pending.size(),
         [](const PendingOp& op) { return op.kind == OpKind::Summon; });
-    std::fill(end, g_context.pending.begin() + g_context.pending_count, PendingOp{});
-    g_context.pending_count = static_cast<std::size_t>(end - g_context.pending.begin());
-    g_pending_hint.store(static_cast<std::uint32_t>(g_context.pending_count), std::memory_order_release);
-}
-
-bool QueueAvailableLocked(std::size_t count) {
-    if (count <= kMaxPending - g_context.pending_count) return true;
-    const auto message = g_context.localizer.Text("status.queue_full", "Operation queue full");
-    g_context.last_result_failed = true;
-    std::snprintf(g_context.last_result.data(), g_context.last_result.size(), "%s", message.c_str());
-    return false;
+    g_context.pending.erase(end, g_context.pending.end());
+    g_pending_hint.store(static_cast<std::uint32_t>(g_context.pending.size()), std::memory_order_release);
 }
 
 void AppendOpLocked(PendingOp op) {
-    g_context.pending[g_context.pending_count++] = std::move(op);
-    g_pending_hint.store(static_cast<std::uint32_t>(g_context.pending_count), std::memory_order_release);
+    g_context.pending.push_back(std::move(op));
+    g_pending_hint.store(static_cast<std::uint32_t>(g_context.pending.size()), std::memory_order_release);
 }
 
 bool PushOp(const PendingOp& op) {
     std::scoped_lock lock(g_context.mutex);
     if (op.kind == OpKind::ClearAll) CancelSummonsLocked();
-    if (!QueueAvailableLocked(1)) return false;
     AppendOpLocked(op);
     return true;
 }
 
 bool PushSelection(OpKind kind, const std::vector<std::uint64_t>& ids, bool enabled = false) {
     std::scoped_lock lock(g_context.mutex);
-    // Submit the complete selection or nothing; a full queue must not apply
-    // an action to just the first few members of a blueprint group.
-    if (!QueueAvailableLocked(ids.size())) return false;
     for (const auto id : ids) AppendOpLocked(PendingOp{kind, id, enabled});
     return true;
 }
@@ -3676,44 +4462,26 @@ bool PushSelection(OpKind kind, const std::vector<std::uint64_t>& ids, bool enab
 bool PushSummon(std::uint32_t count) {
     std::scoped_lock lock(g_context.mutex);
     if (SummonBusyLocked()) return false;
-    if (count == 0 || count > kMaxRecords - g_context.record_count) {
-        const auto available = std::to_string(kMaxRecords - g_context.record_count);
-        const std::array<std::string_view, 1> args{available};
-        const auto message = g_context.localizer.Format("summon.capacity", "Available slots: {0}", args);
-        g_context.last_result_failed = true;
-        std::snprintf(g_context.last_result.data(), g_context.last_result.size(), "%s", message.c_str());
-        return false;
-    }
-    if (!QueueAvailableLocked(count)) return false;
+    if (count == 0) return false;
     auto batch = std::make_shared<SummonBatch>();
     auto& settings = batch->settings;
-    settings.class_path = g_context.class_path.data();
-    settings.display_name = g_context.display_name.data();
+    settings = CaptureSettingsLocked();
     if (settings.display_name.empty()) {
         const auto found = g_context.blueprint_options.find(settings.class_path);
         if (found != g_context.blueprint_options.end())
             settings.display_name = found->second.default_display_name;
     }
-    settings.level = g_context.level;
-    settings.skill_level = g_context.skill_level;
-    settings.hostile = g_context.hostile != 0;
-    settings.pet = g_context.pet != 0;
-    settings.aggressive = g_context.aggressive != 0;
-    settings.ignore_player = g_context.ignore_player != 0;
-    settings.compatibility = g_context.ft_compatibility != 0 &&
+    settings.compatibility = settings.compatibility &&
         MonsterConfigName(settings.class_path).starts_with("FT_");
     if (settings.compatibility) settings.server_combat_blueprint = g_context.final_tower_combat_blueprint;
-    settings.presets = g_context.birth_presets;
     settings.count = count;
-    settings.spacing = g_context.summon_spacing;
     g_context.summon_batch = batch;
     g_context.last_result = {};
     g_context.last_result_failed = false;
-    for (std::uint32_t i = 0; i < count; ++i) {
-        PendingOp op{OpKind::Summon};
-        op.batch = batch;
-        AppendOpLocked(std::move(op));
-    }
+    // Keep one continuation per batch, independent of its requested count.
+    PendingOp op{OpKind::Summon};
+    op.batch = batch;
+    AppendOpLocked(std::move(op));
     return true;
 }
 
@@ -3751,6 +4519,8 @@ void ConsumeSpawnRequest() {
         std::scoped_lock lock(g_context.mutex);
         std::snprintf(g_context.class_path.data(), g_context.class_path.size(),
                       "%s", class_path.c_str());
+        g_context.combat_config_blueprint.clear();
+        g_context.advanced_combat_source = 0;
         g_context.birth_presets[kMaxHpAttribute] = {hp != 0 ? 1 : 0, static_cast<double>(hp)};
         g_context.level = static_cast<std::uint32_t>(level);
         g_context.hostile = request["hostile"].get<bool>() ? 1 : 0;
@@ -3765,16 +4535,14 @@ void DrainOne() {
     PendingOp op{};
     {
         std::scoped_lock lock(g_context.mutex);
-        if (g_context.pending_count == 0) {
+        if (g_context.pending.size() == 0) {
             g_pending_hint.store(0, std::memory_order_release);
             return;
         }
         op = std::move(g_context.pending[0]);
-        for (std::size_t i = 1; i < g_context.pending_count; ++i)
-            g_context.pending[i - 1] = std::move(g_context.pending[i]);
-        g_context.pending[--g_context.pending_count] = {};
+        g_context.pending.pop_front();
         if (op.batch) op.batch->in_progress = true;
-        g_pending_hint.store(static_cast<std::uint32_t>(g_context.pending_count),
+        g_pending_hint.store(static_cast<std::uint32_t>(g_context.pending.size()),
                              std::memory_order_release);
     }
 
@@ -3790,25 +4558,31 @@ void DrainOne() {
         {
             std::scoped_lock lock(g_context.mutex);
             if (result.ok) {
-                if (g_context.record_count < kMaxRecords) {
-                    auto& record = g_context.records[g_context.record_count++];
+                {
+                    auto& record = g_context.records.emplace_back();
                     record = {};
                     record.id = g_context.next_record_id++;
                     record.handle = result.handle;
                     record.pointer = result.pointer;
                     record.pet = result.pet;
+                    record.mute_boss_music = op.batch->settings.mute_boss_music;
+                    record.mute_boss_dialogue = op.batch->settings.mute_boss_dialogue;
+                    if (op.batch->settings.skip_cutscenes)
+                        g_cutscenes.sources[result.pointer] = result.handle;
                     record.hp = result.hp;
                     record.max_hp = result.max_hp;
                     record.registration = result.registration;
                     record.class_path = op.batch->settings.class_path;
                     record.server_combat_source = result.server_combat_source;
                     record.attributes = std::move(result.attributes);
+                    record.editor = std::move(result.editor);
+                    record.editor_warning = std::move(result.editor_warning);
                     std::snprintf(record.label, sizeof(record.label), "%s", result.label);
                     if (op.batch->completed == 0) {
                         g_context.selected_record_id = record.id;
                         g_context.management_blueprint = record.class_path;
                         const auto group_count = std::count_if(g_context.records.begin(),
-                            g_context.records.begin() + g_context.record_count,
+                            g_context.records.begin() + g_context.records.size(),
                             [&](const auto& member) { return member.class_path == record.class_path; });
                         g_context.management_page = (group_count - 1) / kManagementPageSize;
                     }
@@ -3820,6 +4594,8 @@ void DrainOne() {
                 CancelSummonsLocked();
             }
             op.batch->in_progress = false;
+            if (result.ok && !op.batch->stopped && op.batch->completed < op.batch->settings.count)
+                AppendOpLocked(op);
             std::snprintf(g_context.last_result.data(), g_context.last_result.size(), "%s",
                           result.detail);
         }
@@ -3854,7 +4630,8 @@ void DrainOne() {
 void EnsureServices() {
     if (g_context.host == nullptr) return;
     if (g_context.objects != nullptr && g_context.session != nullptr &&
-        g_context.player != nullptr && g_context.names != nullptr)
+        g_context.player != nullptr && g_context.names != nullptr &&
+        g_context.assets != nullptr)
         return;
 
     const anomaly::sdk::Host query(g_context.host);
@@ -3874,6 +4651,11 @@ void EnsureServices() {
         g_context.names = query.Query<AnomalyUe5NamesServiceV1>(
             ANOMALY_UE5_NAMES_SERVICE_V1_ID, ANOMALY_UE5_NAMES_SERVICE_V1_VERSION).get();
     }
+    if (g_context.assets == nullptr) {
+        g_context.assets = query.Query<AnomalyUe5AssetsServiceV1>(
+            ANOMALY_UE5_ASSETS_SERVICE_V1_ID, ANOMALY_UE5_ASSETS_SERVICE_V1_VERSION).get();
+    }
+
 }
 
 }  // namespace
@@ -3883,6 +4665,9 @@ void EnsureServices() {
 namespace {
 
 void ResetState() {
+    ResetCutscenes();
+    g_context.preset_picker.Stop();
+    static_cast<void>(g_context.preset_picker.TakeResult());
     {
         std::scoped_lock lock(g_local_birth_mutex);
         g_local_births.clear();
@@ -3894,16 +4679,20 @@ void ResetState() {
     g_pending_local_births.clear();
     std::scoped_lock lock(g_context.mutex);
     g_context.records = {};
-    g_context.record_count = 0;
     g_context.next_record_id = 1;
     g_context.pending = {};
-    g_context.pending_count = 0;
     g_context.summon_batch.reset();
     g_context.session_world_ready = false;
     g_context.session_event_cursor = 0;
     g_context.frame_counter = 0;
 
     g_context.class_path = {};
+    g_context.combat_config_blueprint.clear();
+    g_context.advanced_combat_blueprint.clear();
+    g_context.advanced_combat_source = 0;
+    g_context.combat_source_filter = {};
+    g_context.combat_source_page = 0;
+    g_context.advanced_config = {};
     g_context.blueprint_config = {};
     g_context.blueprint_check_delay = 0;
     g_context.display_name = {};
@@ -3914,6 +4703,7 @@ void ResetState() {
     g_context.monster_level_query = 0;
     g_layout = {};
     g_layout_ready = false;
+    g_profile_scans.Clear();
     g_context.mirror_getter_entry.clear();
     g_context.final_tower_scene_asset.clear();
     g_context.final_tower_aliases.clear();
@@ -3931,15 +4721,68 @@ void ResetState() {
     g_context.pet = 0;
     g_context.aggressive = 0;
     g_context.ignore_player = 0;
+    g_context.mute_boss_music = 0;
+    g_context.mute_boss_dialogue = 0;
+    g_context.skip_cutscenes = 0;
     g_context.ft_compatibility = 0;
     g_context.summon_count = 1;
     g_context.summon_spacing = 5.0;
+    g_context.config = nullptr;
+    g_context.config_schema = {};
+    g_context.config_task = {};
+    g_context.preset_transfer_task = {};
+    g_context.config_writable = false;
+    g_context.config_dirty = false;
+    g_context.config_stopping = false;
+    g_context.config_revision = 0;
+    g_context.config_error.clear();
+    g_context.preset_message.clear();
+    g_context.saved_presets.clear();
+    g_context.selected_preset = summon_lab::kNoPreset;
+    g_context.new_preset_name = {};
+    g_context.preset_rename = {};
+    g_context.preset_filter = {};
+    g_context.preset_page = 0;
+    std::snprintf(g_context.preset_export_name.data(), g_context.preset_export_name.size(), "%s",
+        summon_lab::kDefaultPresetFileName.data());
+    g_context.preset_export_folder.clear();
+    g_context.preset_import_file.clear();
+    g_context.presets_current_blueprint = 1;
+    g_context.preset_transfer.reset();
     g_context.last_result = {};
     g_context.last_result_failed = false;
+    g_context.editor.blueprints.clear();
+    g_context.editor.snapshot = {};
+    g_context.editor.requested_path.clear();
+    g_context.editor.load_requested = false;
+    g_context.editor.field_filter = {};
+    g_context.editor.skill_filter = {};
+    g_context.editor.effect_filter = {};
+    g_context.editor.field_page = g_context.editor.skill_page = g_context.editor.effect_page = 0;
+    g_context.editor.customized_only = g_context.editor.skills_selected_only = g_context.editor.effects_selected_only = 0;
+    g_context.editor.catalog.store({}, std::memory_order_release);
+    g_context.editor.catalog_requested.store(false, std::memory_order_release);
+    g_context.editor.catalog_busy.store(false, std::memory_order_release);
+    g_context.editor.catalog_task = {};
+    g_context.editor.birth_observer = {};
+    g_context.editor.scan = {};
+    g_context.editor.record_cursor = 0;
     g_context.catalog.clear();
     g_context.blueprint_options.clear();
     g_context.catalog_filter[0] = '\0';
     g_context.catalog_loaded = false;
+    g_context.catalog_labels.store({}, std::memory_order_release);
+    g_context.catalog_base.clear();
+    g_context.catalog_name_table.clear();
+    g_context.catalog_policy.clear();
+    g_context.catalog_exclusions.clear();
+    g_context.catalog_name_aliases.clear();
+    g_context.catalog_stop.store(false, std::memory_order_release);
+    g_context.catalog_busy.store(false, std::memory_order_release);
+    g_context.catalog_refresh_requested.store(true, std::memory_order_release);
+    g_context.catalog_preparing = false;
+    g_context.catalog_task = {};
+    g_context.catalog_scan_status = {};
     g_context.selected_record_id = 0;
     g_context.management_page = 0;
     g_context.management_blueprint.clear();
@@ -3983,6 +4826,13 @@ AnomalyStatusV1 ANOMALY_CALL Start(void* context) {
         ANOMALY_NTE_PLAYER_SERVICE_V1_ID, ANOMALY_NTE_PLAYER_SERVICE_V1_VERSION).get();
     g_context.names = query.Query<AnomalyUe5NamesServiceV1>(
         ANOMALY_UE5_NAMES_SERVICE_V1_ID, ANOMALY_UE5_NAMES_SERVICE_V1_VERSION).get();
+    g_context.assets = query.Query<AnomalyUe5AssetsServiceV1>(
+        ANOMALY_UE5_ASSETS_SERVICE_V1_ID, ANOMALY_UE5_ASSETS_SERVICE_V1_VERSION).get();
+    g_context.scheduler = query.Query<AnomalySchedulerServiceV1>(
+        ANOMALY_SCHEDULER_SERVICE_V1_ID, ANOMALY_SCHEDULER_SERVICE_V1_VERSION).get();
+    g_context.storage = query.Query<AnomalyStorageServiceV1>(
+        ANOMALY_STORAGE_SERVICE_V1_ID, ANOMALY_STORAGE_SERVICE_V1_VERSION).get();
+    InitializeConfiguration(query);
 
     TransferLocalBirths(false);
 
@@ -3991,29 +4841,56 @@ AnomalyStatusV1 ANOMALY_CALL Start(void* context) {
     g_context.events = events.get();
     g_context.has_invoke = HasInvoke(g_context.events);
 
-    const auto loaded = anomaly::sdk::LoadProfile(query, "compatibility.profile.json");
+    const auto loaded = anomaly::sdk::LoadProfile(query, "compatibility.profile.json",
+        {"nte", "HTGame.exe", ".text", "summon-lab-v2"});
     if (loaded && ValidateSummonProfile(loaded.value(), &g_layout)) {
         const auto& profile = loaded.value();
+        constexpr std::array<std::string_view, 15> symbols{
+            "story-boss-music", "story-multiple-voices", "story-debug-voices", "story-single-voice",
+            "duel-current-chase-range", "monster-scene-row", "monster-property-pack", "final-tower-property-pack",
+            "object-item-set-flags", "object-array-reference", "attribute-base-input", "summon-registration",
+            "local-attribute-mirror", "native-damage-report", "monster-default-level"};
+        const auto scan_started = std::chrono::steady_clock::now();
+        g_profile_scans.Prepare(query, profile, symbols);
+        const auto scan_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - scan_started).count();
+        if (g_context.core && g_context.core->log) {
+            char message[160]{};
+            std::snprintf(message, sizeof(message), "SummonLab: signatures mode=%s patterns=%zu elapsed_ms=%lld",
+                g_profile_scans.batched() ? "v3-batch" : "v1", g_profile_scans.size(), static_cast<long long>(scan_ms));
+            g_context.core->log(g_context.core->user, ANOMALY_CORE_LOG_LEVEL_V1_INFO, anomaly::sdk::StringView(message));
+        }
         g_layout_ready = true;
-        g_context.monster_level_query = ResolveMonsterLevelQuery(query, profile);
-        g_context.current_chase_range_offset = ResolveDuelChaseRange(query, profile);
+        g_cutscenes.profile = profile;
+        g_cutscenes.pending = true;
+        StartBlueprintEditor();
+        g_context.monster_level_query = ResolveMonsterLevelQuery(profile);
+        g_context.current_chase_range_offset = ResolveDuelChaseRange(profile);
         const bool attributes_ready = InstallBirthAttributeHook(query, profile);
-        const bool combat_ready = attributes_ready && InstallLocalCombatHooks(query, profile);
+        const bool combat_ready = attributes_ready && InstallLocalCombatHooks(profile);
         g_context.birth_attributes_ready.store(attributes_ready && combat_ready, std::memory_order_release);
-        if (combat_ready && !InstallFinalTowerHooks(query, profile) && g_context.core != nullptr)
+        if (combat_ready && !InstallFinalTowerHooks(profile) && g_context.core != nullptr)
             g_context.core->log(g_context.core->user, ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
                 anomaly::sdk::StringView("SummonLab: FinalTower config bridge unavailable"));
         if (combat_ready) {
+            const bool audio_ready = InstallStoryAudioHooks(profile);
+            g_context.core->log(g_context.core->user, audio_ready ? ANOMALY_CORE_LOG_LEVEL_V1_INFO :
+                ANOMALY_CORE_LOG_LEVEL_V1_WARNING, anomaly::sdk::StringView(audio_ready ?
+                    "SummonLab: instance boss music and dialogue control ready" :
+                    "SummonLab: instance boss music and dialogue control unavailable"));
             StartFinalTowerHealthObserver();
-            if (!InstallDamageReportObserver(query, profile))
+            if (!InstallDamageReportObserver(profile))
                 g_context.core->log(g_context.core->user, ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
                     anomaly::sdk::StringView("SummonLab: native damage observer unavailable"));
         }
+        g_profile_scans.Clear();
     } else if (g_context.core != nullptr && g_context.core->log != nullptr) {
         g_context.core->log(g_context.core->user, ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
             anomaly::sdk::StringView(loaded ? "Unsupported SummonLab profile contract or layout" : loaded.error()));
     }
-    static_cast<void>(LoadCatalog());
+    try {
+        if (LoadCatalogPolicy()) LoadCatalogCache();
+    } catch (...) { SetScanStatus("catalog.scan.failed", "Catalog refresh failed"); }
     ConsumeSpawnRequest();
 
     return anomaly::sdk::Ok();
@@ -4021,6 +4898,31 @@ AnomalyStatusV1 ANOMALY_CALL Start(void* context) {
 
 AnomalyStatusV1 ANOMALY_CALL Stop(void* context, std::uint32_t) {
     if (context != &g_context) return {ANOMALY_STATUS_V1_INVALID_ARGUMENT, 0, {}};
+    g_context.preset_picker.Stop();
+    {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.config_stopping = true;
+        ConsumePresetPickerLocked();
+    }
+    // The host drains Worker callbacks before on_stop and retains config schemas
+    // through it, so the latest pending edit can be flushed on Lifecycle.
+    if (g_context.scheduler && g_context.config_task.id)
+        static_cast<void>(g_context.scheduler->cancel(g_context.scheduler->user, g_context.config_task));
+    if (g_context.scheduler && g_context.preset_transfer_task.id)
+        static_cast<void>(g_context.scheduler->cancel(g_context.scheduler->user, g_context.preset_transfer_task));
+    if (!SaveConfiguration() && g_context.core && g_context.core->log)
+        g_context.core->log(g_context.core->user, ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
+            anomaly::sdk::StringView("SummonLab: configuration flush failed"));
+    g_context.catalog_stop.store(true, std::memory_order_release);
+    if (g_context.scheduler && g_context.catalog_task.id)
+        static_cast<void>(g_context.scheduler->cancel(g_context.scheduler->user, g_context.catalog_task));
+    if (g_context.scheduler && g_context.editor.catalog_task.id)
+        static_cast<void>(g_context.scheduler->cancel(g_context.scheduler->user, g_context.editor.catalog_task));
+    if (g_context.events && g_context.editor.birth_observer.id) {
+        const auto status = g_context.events->unsubscribe(g_context.events->user, g_context.editor.birth_observer);
+        if (status.code != ANOMALY_STATUS_V1_OK && status.code != ANOMALY_STATUS_V1_NOT_FOUND) return status;
+    }
+    g_context.editor.birth_observer = {};
     if (g_context.events != nullptr && g_context.health_observer.id != 0) {
         const auto status = g_context.events->unsubscribe(g_context.events->user, g_context.health_observer);
         if (status.code != ANOMALY_STATUS_V1_OK && status.code != ANOMALY_STATUS_V1_NOT_FOUND) return status;
@@ -4031,6 +4933,10 @@ AnomalyStatusV1 ANOMALY_CALL Stop(void* context, std::uint32_t) {
     g_context.events = nullptr;
     g_context.monster_level_query = 0;
     g_context.birth_attributes_ready.store(false, std::memory_order_release);
+    const auto cutscene_status = ReleaseCutsceneHooks();
+    if (cutscene_status.code != ANOMALY_STATUS_V1_OK) return cutscene_status;
+    const auto audio_status = ReleaseStoryAudioHooks();
+    if (audio_status.code != ANOMALY_STATUS_V1_OK) return audio_status;
     const auto local_status = ReleaseLocalCombatHooks();
     if (local_status.code != ANOMALY_STATUS_V1_OK) return local_status;
     ReleaseFinalTowerData();
@@ -4066,7 +4972,9 @@ void ANOMALY_CALL Update(void* /*context*/, double delta_seconds) {
     ++g_context.frame_counter;
     EnsureServices();
     UpdateSessionState();
+    if (g_context.session_world_ready) AdvanceCatalogPreparation();
     if (!g_context.session_world_ready || !g_layout_ready) return;
+    UpdateCutscenes();
     ResolveFinalTowerHealthEvents();
     // The host runs on_update at its Game tick boundary. Do not invoke spawn
     // or configuration from arbitrary ProcessEvent callbacks: those may be
@@ -4074,17 +4982,29 @@ void ANOMALY_CALL Update(void* /*context*/, double delta_seconds) {
     RestoreLocalBirthsOnGameThread();
     ConfigureNativeBirthsOnGameThread();
     UpdateBlueprintConfig(delta_seconds);
+    UpdateAdvancedConfig();
+    UpdateEditorFields();
+    AdvanceEditorCatalog();
+    MaintainBlueprintEdits();
     bool spawning{};
     {
         std::scoped_lock lock(g_context.mutex);
-        spawning = g_context.pending_count != 0 && g_context.pending[0].kind == OpKind::Summon;
+        spawning = g_context.pending.size() != 0 && g_context.pending[0].kind == OpKind::Summon;
     }
     const bool refresh = (g_context.frame_counter % kHealthRefreshInterval) == 0;
     // Retire dead registrations before a spawn can reuse their native slots.
     // Battle maintenance must also keep running during a long summon batch.
-    if (spawning || refresh) RefreshHealth();
+    if (spawning || refresh) RefreshHealth(refresh);
     if (refresh) MaintainBattles();
-    if (g_pending_hint.load(std::memory_order_relaxed) != 0) DrainOne();
+    const auto work_started = std::chrono::steady_clock::now();
+    while (g_pending_hint.load(std::memory_order_relaxed) != 0) {
+        DrainOne();
+        // A summon is indivisible; check the frame budget between native calls.
+        // Finalize registration before starting the next member of the batch.
+        RestoreLocalBirthsOnGameThread();
+        ConfigureNativeBirthsOnGameThread();
+        if (std::chrono::steady_clock::now() - work_started >= std::chrono::milliseconds(4)) break;
+    }
 
 }
 
@@ -4107,17 +5027,25 @@ void WrappedText(const AnomalyUiServiceV1* ui, std::string_view text) {
         ui->text(ui->user, anomaly::sdk::StringView(text));
 }
 
-void DrawBlueprintConfig(const AnomalyUiServiceV1* ui) {
+void DrawBlueprintConfig(const AnomalyUiServiceV1* ui, bool select_source) {
     BlueprintConfigState state;
     std::string source;
     std::string normal_combat_blueprint;
+    std::string selected_source;
+    std::vector<CombatConfigChoice> sources;
     {
         std::scoped_lock lock(g_context.mutex);
         if (g_context.class_path[0] == '\0') return;
         const auto& check = g_context.blueprint_config;
         state = !g_context.session_world_ready ? BlueprintConfigState::Unavailable :
-            check.path != g_context.class_path.data() ? BlueprintConfigState::Pending : check.state;
-        if (check.path == g_context.class_path.data()) source = check.source;
+            check.path != g_context.class_path.data() ||
+            check.requested_source != g_context.combat_config_blueprint
+                ? BlueprintConfigState::Pending : check.state;
+        if (check.path == g_context.class_path.data()) {
+            sources = check.sources;
+            selected_source = g_context.combat_config_blueprint;
+            if (check.requested_source == selected_source) source = check.source;
+        }
         const auto entry = g_context.blueprint_options.find(g_context.class_path.data());
         if (entry != g_context.blueprint_options.end())
             normal_combat_blueprint = entry->second.normal_combat_blueprint;
@@ -4135,7 +5063,9 @@ void DrawBlueprintConfig(const AnomalyUiServiceV1* ui) {
         text = localizer.Text("catalog.config_not_applicable", "Combat config check is not supported for this blueprint");
         break;
     case BlueprintConfigState::NoHealth:
-        text = localizer.Text("catalog.config_no_health", "No valid HP config found in the current scene");
+        text = sources.empty()
+            ? localizer.Text("catalog.config_no_health", "No valid HP config found in the current scene")
+            : localizer.Text("catalog.config_choose", "No default HP; a variant's combat config can be selected");
         break;
     case BlueprintConfigState::Available:
         text = localizer.Text("catalog.config_available", "Combat config found");
@@ -4144,7 +5074,33 @@ void DrawBlueprintConfig(const AnomalyUiServiceV1* ui) {
     WrappedText(ui, text);
     if (!source.empty()) {
         const std::array<std::string_view, 1> args{source};
-        WrappedText(ui, localizer.Format("catalog.config_source", "FT config: {0}", args));
+        WrappedText(ui, localizer.Format("catalog.config_source", "Combat config: {0}", args));
+    }
+    if (select_source && (!sources.empty() || !selected_source.empty()) &&
+        ui->begin_menu != nullptr && ui->end_menu != nullptr) {
+        const auto label = localizer.Text("catalog.config_select", "Select source");
+        if (ui->begin_menu(ui->user, anomaly::sdk::StringView(label), 1)) {
+            const auto native = localizer.Text("catalog.config_native", "Blueprint defaults");
+            if (ActionButton(ui, native.c_str(), !selected_source.empty())) {
+                std::scoped_lock lock(g_context.mutex);
+                g_context.combat_config_blueprint.clear();
+                ConfigurationChangedLocked();
+            }
+            for (const auto& choice : sources) {
+                const auto name = MonsterConfigName(choice.path);
+                char hp[48]{};
+                std::snprintf(hp, sizeof(hp), "%.9g", choice.hp);
+                const std::array<std::string_view, 2> args{name, hp};
+                const auto item = localizer.Format("catalog.config_choice", "{0} | HP {1}", args) +
+                    "##combat-source-" + choice.path;
+                if (ActionButton(ui, item.c_str(), choice.path != selected_source)) {
+                    std::scoped_lock lock(g_context.mutex);
+                    g_context.combat_config_blueprint = choice.path;
+                    ConfigurationChangedLocked();
+                }
+            }
+            ui->end_menu(ui->user);
+        }
     }
     if (!normal_combat_blueprint.empty()) {
         WrappedText(ui, localizer.Text("catalog.story_balance",
@@ -4156,6 +5112,8 @@ void DrawBlueprintConfig(const AnomalyUiServiceV1* ui) {
             std::scoped_lock lock(g_context.mutex);
             std::snprintf(g_context.class_path.data(), g_context.class_path.size(), "%s",
                 normal_combat_blueprint.c_str());
+            g_context.combat_config_blueprint.clear();
+            ConfigurationChangedLocked();
         }
     }
     if (state == BlueprintConfigState::Unavailable) {
@@ -4181,8 +5139,24 @@ void DrawBlueprintTab(const AnomalyUiServiceV1* ui) {
     if (ui->input_text != nullptr) {
         const std::string label = localizer.Text("target.title", "Class path");
         std::scoped_lock lock(g_context.mutex);
-        ui->input_text(ui->user, anomaly::sdk::StringView(label), g_context.class_path.data(),
-                       g_context.class_path.size(), 0);
+        if (ui->input_text(ui->user, anomaly::sdk::StringView(label), g_context.class_path.data(),
+                       g_context.class_path.size(), 0)) {
+            g_context.combat_config_blueprint.clear();
+            ConfigurationChangedLocked();
+        }
+    }
+
+    const auto rescan_label = localizer.Text("catalog.scan", "Refresh catalog");
+    if (ActionButton(ui, rescan_label.c_str(), !g_context.catalog_busy.load(std::memory_order_acquire)))
+        g_context.catalog_refresh_requested.store(true, std::memory_order_release);
+    std::array<char, 160> scan_status;
+    {
+        std::scoped_lock lock(g_context.mutex);
+        scan_status = g_context.catalog_scan_status;
+    }
+    if (scan_status[0]) {
+        if (ui->same_line) ui->same_line(ui->user, 0, 10);
+        ui->text(ui->user, anomaly::sdk::StringView(scan_status.data()));
     }
 
     if (!loaded) {
@@ -4196,7 +5170,10 @@ void DrawBlueprintTab(const AnomalyUiServiceV1* ui) {
                 std::scoped_lock lock(g_context.mutex);
                 if (ui->input_text(ui->user, anomaly::sdk::StringView(filter_label),
                                    g_context.catalog_filter, sizeof(g_context.catalog_filter), 0))
+                {
                     g_context.catalog_page = 0;
+                    ConfigurationChangedLocked();
+                }
             }
         }
 
@@ -4288,6 +5265,8 @@ void DrawBlueprintTab(const AnomalyUiServiceV1* ui) {
                     std::scoped_lock lock(g_context.mutex);
                     std::snprintf(g_context.class_path.data(), g_context.class_path.size(), "%s",
                                   entry.path.c_str());
+                    g_context.combat_config_blueprint.clear();
+                    ConfigurationChangedLocked();
                     g_context.last_result_failed = false;
                     std::snprintf(g_context.last_result.data(), g_context.last_result.size(), "%s",
                                   entry.path.c_str());
@@ -4296,7 +5275,7 @@ void DrawBlueprintTab(const AnomalyUiServiceV1* ui) {
         }
         if (has_child) ui->end_child(ui->user);
     }
-    DrawBlueprintConfig(ui);
+    DrawBlueprintConfig(ui, false);
 }
 
 void DrawSettingsTab(const AnomalyUiServiceV1* ui) {
@@ -4304,10 +5283,12 @@ void DrawSettingsTab(const AnomalyUiServiceV1* ui) {
     std::scoped_lock lock(g_context.mutex);
     if (ui->input_uint32 != nullptr) {
         const auto level_label = localizer.Text("param.level", "Level (0 = default)");
-        ui->input_uint32(ui->user, anomaly::sdk::StringView(level_label), &g_context.level, 0, 0);
+        if (ui->input_uint32(ui->user, anomaly::sdk::StringView(level_label), &g_context.level, 0, 0))
+            ConfigurationChangedLocked();
         g_context.level = std::min(g_context.level, kMaxLevel);
         const auto skill_label = localizer.Text("param.skill_level", "Skill level (0 = default)");
-        ui->input_uint32(ui->user, anomaly::sdk::StringView(skill_label), &g_context.skill_level, 0, 0);
+        if (ui->input_uint32(ui->user, anomaly::sdk::StringView(skill_label), &g_context.skill_level, 0, 0))
+            ConfigurationChangedLocked();
         g_context.skill_level = std::min(g_context.skill_level, kMaxLevel);
     }
     WrappedText(ui, localizer.Text("settings.hint",
@@ -4315,12 +5296,13 @@ void DrawSettingsTab(const AnomalyUiServiceV1* ui) {
     if (ui->separator != nullptr) ui->separator(ui->user);
     if (ui->input_text != nullptr) {
         const auto label = localizer.Text("settings.filter", "Find attribute");
-        ui->input_text(ui->user, anomaly::sdk::StringView(label), g_context.attribute_filter.data(),
-                       g_context.attribute_filter.size(), 0);
+        if (ui->input_text(ui->user, anomaly::sdk::StringView(label), g_context.attribute_filter.data(),
+                       g_context.attribute_filter.size(), 0)) ConfigurationChangedLocked();
     }
     if (ui->checkbox != nullptr) {
         const auto label = localizer.Text("settings.only_overrides", "Only customized");
-        ui->checkbox(ui->user, anomaly::sdk::StringView(label), &g_context.only_overrides);
+        if (ui->checkbox(ui->user, anomaly::sdk::StringView(label), &g_context.only_overrides))
+            ConfigurationChangedLocked();
     }
     if (ui->same_line != nullptr) ui->same_line(ui->user, 0.0F, 10.0F);
     const auto reset = localizer.Text("settings.reset", "Reset all attributes");
@@ -4328,6 +5310,7 @@ void DrawSettingsTab(const AnomalyUiServiceV1* ui) {
         g_context.level = 0;
         g_context.skill_level = 0;
         g_context.birth_presets = {};
+        ConfigurationChangedLocked();
     }
 
     const auto enabled_count = std::count_if(g_context.birth_presets.begin(), g_context.birth_presets.end(),
@@ -4371,8 +5354,10 @@ void DrawSettingsTab(const AnomalyUiServiceV1* ui) {
             if (ui->same_line != nullptr) ui->same_line(ui->user, 0.0F, 6.0F);
             // The localized label never changes the reflected field or preset identity.
             const std::string label = description.label + "###birth-enabled-" + std::string(name);
-            if (ui->checkbox != nullptr)
-                ui->checkbox(ui->user, anomaly::sdk::StringView(label), &preset.enabled);
+            if (ui->checkbox != nullptr) {
+                if (ui->checkbox(ui->user, anomaly::sdk::StringView(label), &preset.enabled))
+                    ConfigurationChangedLocked();
+            }
             else
                 ui->text(ui->user, anomaly::sdk::StringView(description.label));
             if (table) ui->table_next_column(ui->user);
@@ -4381,7 +5366,8 @@ void DrawSettingsTab(const AnomalyUiServiceV1* ui) {
                         sizeof(ui->set_next_item_width) && ui->set_next_item_width != nullptr)
                     ui->set_next_item_width(ui->user, 160.0F);
                 const std::string value_id = "##birth-value-" + std::string(name);
-                ui->input_double(ui->user, anomaly::sdk::StringView(value_id), &preset.value, 0.0, 0.0);
+                if (ui->input_double(ui->user, anomaly::sdk::StringView(value_id), &preset.value, 0.0, 0.0))
+                    ConfigurationChangedLocked();
             } else {
                 ui->text(ui->user, anomaly::sdk::StringView(localizer.Text("settings.default", "Default")));
             }
@@ -4400,6 +5386,94 @@ void DrawSettingsTab(const AnomalyUiServiceV1* ui) {
     if (!error.empty()) WrappedText(ui, error);
 }
 
+void DrawPresetSaveArea(const AnomalyUiServiceV1* ui);
+std::string BlueprintLabel(std::string_view path);
+
+#include "blueprint_editor_ui.hpp"
+
+bool DrawAdvancedSummonOptions(const AnomalyUiServiceV1* ui) {
+    const auto& localizer = g_context.localizer;
+    std::scoped_lock lock(g_context.mutex);
+    if (ui->checkbox) {
+        const auto enabled = localizer.Text("summon.advanced_source", "Use any blueprint's combat attributes");
+        if (ui->checkbox(ui->user, anomaly::sdk::StringView(enabled), &g_context.advanced_combat_source)) {
+            if (g_context.advanced_combat_source && g_context.advanced_combat_blueprint.empty())
+                g_context.advanced_combat_blueprint = g_context.combat_config_blueprint.empty()
+                    ? g_context.class_path.data() : g_context.combat_config_blueprint;
+            ConfigurationChangedLocked();
+        }
+    }
+    if (!g_context.advanced_combat_source) return false;
+
+    const auto source = g_context.advanced_combat_blueprint.empty()
+        ? localizer.Text("catalog.config_native", "Blueprint defaults")
+        : BlueprintLabel(g_context.advanced_combat_blueprint);
+    const std::array<std::string_view, 1> source_args{source};
+    WrappedText(ui, localizer.Format("summon.advanced_selected", "Attribute source: {0}", source_args));
+    if (ui->begin_menu && ui->end_menu) {
+        const auto select = localizer.Label("catalog.config_select", "Select source", "advanced-source");
+        if (ui->begin_menu(ui->user, anomaly::sdk::StringView(select), 1)) {
+            if (ui->input_text) {
+                const auto search = localizer.Label("catalog.filter", "Search", "combat-source-filter");
+                if (ui->input_text(ui->user, anomaly::sdk::StringView(search), g_context.combat_source_filter.data(),
+                        g_context.combat_source_filter.size(), 0)) g_context.combat_source_page = 0;
+            }
+            std::vector<const ClassEntry*> matches;
+            for (const auto& entry : g_context.catalog) {
+                const auto filter = g_context.combat_source_filter.data();
+                if (*filter && !(ui->filter_match
+                    ? ui->filter_match(ui->user, anomaly::sdk::StringView(filter), anomaly::sdk::StringView(entry.search_text)) != 0
+                    : entry.search_text.find(filter) != std::string::npos)) continue;
+                matches.push_back(&entry);
+            }
+            constexpr std::size_t page_size = 10;
+            const auto pages = std::max<std::size_t>(1, (matches.size() + page_size - 1) / page_size);
+            auto& page = g_context.combat_source_page;
+            page = std::min(page, pages - 1);
+            const auto previous = localizer.Label("page.prev", "<", "combat-source-prev");
+            if (ActionButton(ui, previous.c_str(), page > 0)) --page;
+            if (ui->same_line) ui->same_line(ui->user, 0, 10);
+            const auto number = std::to_string(page + 1), count = std::to_string(pages);
+            const std::array<std::string_view, 2> page_args{number, count};
+            ui->text(ui->user, anomaly::sdk::StringView(localizer.Format("page.indicator", "{0} / {1}", page_args)));
+            if (ui->same_line) ui->same_line(ui->user, 0, 10);
+            const auto next = localizer.Label("page.next", ">", "combat-source-next");
+            if (ActionButton(ui, next.c_str(), page + 1 < pages)) ++page;
+            const auto end = std::min(matches.size(), (page + 1) * page_size);
+            for (auto i = page * page_size; i < end; ++i) {
+                const auto& entry = *matches[i];
+                const auto label = entry.label + "###advanced-combat-source-" + entry.path;
+                if (ActionButton(ui, label.c_str(), entry.path != g_context.advanced_combat_blueprint)) {
+                    g_context.advanced_combat_blueprint = entry.path;
+                    ConfigurationChangedLocked();
+                    if (ui->close_current_popup) ui->close_current_popup(ui->user);
+                }
+            }
+            if (matches.empty()) WrappedText(ui, localizer.Text("catalog.no_match", "No matching blueprints"));
+            ui->end_menu(ui->user);
+        }
+    }
+    if (g_context.advanced_combat_blueprint.empty()) return true;
+    const auto& check = g_context.advanced_config;
+    const auto state = check.path == g_context.advanced_combat_blueprint
+        ? check.state : BlueprintConfigState::Pending;
+    if (state == BlueprintConfigState::Available) {
+        char hp[48]{};
+        std::snprintf(hp, sizeof(hp), "%.9g", check.hp);
+        const std::array<std::string_view, 1> args{hp};
+        WrappedText(ui, localizer.Format("summon.source_hp", "Source default HP: {0}", args));
+    } else if (state == BlueprintConfigState::Pending) {
+        WrappedText(ui, localizer.Text("catalog.config_pending", "Checking combat config..."));
+    } else if (state == BlueprintConfigState::NoHealth || state == BlueprintConfigState::NotApplicable) {
+        WrappedText(ui, localizer.Text("catalog.config_no_health", "No valid HP config found in the current scene"));
+    } else {
+        WrappedText(ui, localizer.Text("catalog.config_unavailable", "Combat config check unavailable"));
+        const auto retry = localizer.Label("catalog.config_retry", "Recheck", "advanced-source-retry");
+        if (ActionButton(ui, retry.c_str(), true)) g_context.advanced_config = {};
+    }
+    return true;
+}
+
 void DrawSummonTab(const AnomalyUiServiceV1* ui, bool ready) {
     const auto& localizer = g_context.localizer;
     bool can_summon{};
@@ -4413,21 +5487,20 @@ void DrawSummonTab(const AnomalyUiServiceV1* ui, bool ready) {
         WrappedText(ui, localizer.Format("summon.target", "Blueprint: {0}", target_args));
         if (ui->input_text != nullptr) {
             const auto label = localizer.Text("param.name", "Name (blank = default)");
-            ui->input_text(ui->user, anomaly::sdk::StringView(label), g_context.display_name.data(),
-                           g_context.display_name.size(), 0);
+            if (ui->input_text(ui->user, anomaly::sdk::StringView(label), g_context.display_name.data(),
+                           g_context.display_name.size(), 0)) ConfigurationChangedLocked();
         }
         if (ui->input_uint32 != nullptr) {
             const auto label = localizer.Text("summon.count", "Count");
-            ui->input_uint32(ui->user, anomaly::sdk::StringView(label), &g_context.summon_count, 0, 0);
+            if (ui->input_uint32(ui->user, anomaly::sdk::StringView(label), &g_context.summon_count, 0, 0))
+                ConfigurationChangedLocked();
         }
         summon_count = g_context.summon_count;
         if (summon_count > 1 && ui->input_double != nullptr) {
             const auto label = localizer.Text("summon.spacing", "Spacing (m)");
-            ui->input_double(ui->user, anomaly::sdk::StringView(label), &g_context.summon_spacing, 0, 0);
+            if (ui->input_double(ui->user, anomaly::sdk::StringView(label), &g_context.summon_spacing, 0, 0))
+                ConfigurationChangedLocked();
         }
-        const auto capacity = std::to_string(kMaxRecords - g_context.record_count);
-        const std::array<std::string_view, 1> capacity_args{capacity};
-        WrappedText(ui, localizer.Format("summon.capacity", "Available slots: {0}", capacity_args));
         const bool spacing_valid = std::isfinite(g_context.summon_spacing) &&
             g_context.summon_spacing >= 0.0 && g_context.summon_spacing <= 100.0;
         if (summon_count > 1 && !spacing_valid)
@@ -4453,20 +5526,30 @@ void DrawSummonTab(const AnomalyUiServiceV1* ui, bool ready) {
         if (ui->separator != nullptr) ui->separator(ui->user);
         if (ui->checkbox != nullptr) {
             const auto hostile = localizer.Text("param.hostile", "Hostile");
-            ui->checkbox(ui->user, anomaly::sdk::StringView(hostile), &g_context.hostile);
+            if (ui->checkbox(ui->user, anomaly::sdk::StringView(hostile), &g_context.hostile)) ConfigurationChangedLocked();
             if (ui->same_line != nullptr) ui->same_line(ui->user, 0.0F, 12.0F);
             const auto pet = localizer.Text("param.pet", "Pet");
-            ui->checkbox(ui->user, anomaly::sdk::StringView(pet), &g_context.pet);
+            if (ui->checkbox(ui->user, anomaly::sdk::StringView(pet), &g_context.pet)) ConfigurationChangedLocked();
             if (ui->same_line != nullptr) ui->same_line(ui->user, 0.0F, 12.0F);
             const auto aggressive = localizer.Text("param.aggressive", "Aggressive");
-            ui->checkbox(ui->user, anomaly::sdk::StringView(aggressive), &g_context.aggressive);
+            if (ui->checkbox(ui->user, anomaly::sdk::StringView(aggressive), &g_context.aggressive)) ConfigurationChangedLocked();
+            if (ui->same_line != nullptr) ui->same_line(ui->user, 0.0F, 12.0F);
             const auto ignore_player = localizer.Text("param.ignore_player", "Do not target the player");
-            ui->checkbox(ui->user, anomaly::sdk::StringView(ignore_player), &g_context.ignore_player);
+            if (ui->checkbox(ui->user, anomaly::sdk::StringView(ignore_player), &g_context.ignore_player)) ConfigurationChangedLocked();
+            const auto mute_music = localizer.Text("param.mute_boss_music", "Disable boss music");
+            if (ui->checkbox(ui->user, anomaly::sdk::StringView(mute_music), &g_context.mute_boss_music)) ConfigurationChangedLocked();
+            if (ui->same_line != nullptr) ui->same_line(ui->user, 0.0F, 12.0F);
+            const auto mute_dialogue = localizer.Text("param.mute_boss_dialogue", "Disable boss dialogue");
+            if (ui->checkbox(ui->user, anomaly::sdk::StringView(mute_dialogue), &g_context.mute_boss_dialogue)) ConfigurationChangedLocked();
+            ui->same_line(ui->user, 0.0f, -1.0f);
+            const auto skip_cutscenes = localizer.Text("param.skip_cutscenes", "Disable cutscenes");
+            if (ui->checkbox(ui->user, anomaly::sdk::StringView(skip_cutscenes), &g_context.skip_cutscenes)) ConfigurationChangedLocked();
         }
-        if (MonsterConfigName(path).starts_with("FT_")) {
+        if (MonsterConfigName(path).starts_with("FT_") &&
+            !(g_context.advanced_combat_source && !g_context.advanced_combat_blueprint.empty())) {
             if (ui->checkbox != nullptr) {
                 const auto label = localizer.Text("summon.compatibility", "FT compatibility (experimental)");
-                ui->checkbox(ui->user, anomaly::sdk::StringView(label), &g_context.ft_compatibility);
+                if (ui->checkbox(ui->user, anomaly::sdk::StringView(label), &g_context.ft_compatibility)) ConfigurationChangedLocked();
             }
             if (g_context.ft_compatibility != 0) {
                 const auto source = MonsterConfigName(g_context.final_tower_combat_blueprint);
@@ -4479,7 +5562,7 @@ void DrawSummonTab(const AnomalyUiServiceV1* ui, bool ready) {
         const auto error = BirthPresetError(g_context.birth_presets);
         if (!error.empty()) WrappedText(ui, error);
         can_summon = ready && g_context.class_path[0] != '\0' &&
-            summon_count > 0 && summon_count <= kMaxRecords - g_context.record_count &&
+            summon_count > 0 &&
             (summon_count == 1 || spacing_valid) && !SummonBusyLocked() && error.empty();
         if (g_context.summon_batch && g_context.summon_batch->settings.count > 1) {
             const auto& batch = *g_context.summon_batch;
@@ -4495,7 +5578,7 @@ void DrawSummonTab(const AnomalyUiServiceV1* ui, bool ready) {
             if (ActionButton(ui, cancel.c_str(), true)) CancelSummonsLocked();
         }
     }
-    DrawBlueprintConfig(ui);
+    if (!DrawAdvancedSummonOptions(ui)) DrawBlueprintConfig(ui, true);
     if (!g_context.birth_attributes_ready.load(std::memory_order_acquire)) {
         WrappedText(ui, localizer.Text("param.birth_unavailable",
             "The native summon initializer is unavailable"));
@@ -4504,18 +5587,197 @@ void DrawSummonTab(const AnomalyUiServiceV1* ui, bool ready) {
     const auto label = localizer.Text("action.summon", "Summon");
     if (ActionButton(ui, label.c_str(), can_summon, -1.0F))
         (void)PushSummon(summon_count);
+    DrawPresetSaveArea(ui);
 }
 
 std::string BlueprintLabel(std::string_view path) {
+    const auto labels = g_context.catalog_labels.load(std::memory_order_acquire);
+    if (labels) {
+        if (const auto found = labels->find(path); found != labels->end()) return found->second;
+    }
     const auto separator = path.find_last_of("/.");
     const auto name = separator == std::string_view::npos ? path : path.substr(separator + 1);
-    const auto names = summon_lab::ResolveBlueprintNames(name, g_context.localizer);
-    const auto& alias = names.specific.empty() ? names.family : names.specific;
-    return alias.empty() ? std::string(name) : alias + " | " + std::string(name);
+    return std::string(name);
+}
+
+void DrawPresetSaveArea(const AnomalyUiServiceV1* ui) {
+    const auto& localizer = g_context.localizer;
+    std::scoped_lock lock(g_context.mutex);
+    if (ui->separator) ui->separator(ui->user);
+    WrappedText(ui, localizer.Text("presets.save_area", "Save to presets"));
+    if (ui->input_text) {
+        const auto label = localizer.Text("presets.name", "Preset name");
+        ui->input_text(ui->user, anomaly::sdk::StringView(label),
+            g_context.new_preset_name.data(), g_context.new_preset_name.size(), 0);
+    }
+    const bool valid = g_context.config_writable && !g_context.preset_transfer &&
+        summon_lab::ValidPresetName(g_context.new_preset_name.data()) &&
+        summon_lab::ValidBlueprintPath(g_context.class_path.data()) &&
+        g_context.summon_count > 0 && std::isfinite(g_context.summon_spacing) &&
+        g_context.summon_spacing >= 0 && g_context.summon_spacing <= 100 &&
+        BirthPresetError(g_context.birth_presets).empty();
+    const auto save = localizer.Text("presets.save_new", "Save new preset");
+    if (ActionButton(ui, save.c_str(), valid)) {
+        g_context.saved_presets.push_back({g_context.new_preset_name.data(), CaptureSettingsLocked()});
+        g_context.selected_preset = g_context.saved_presets.size() - 1;
+        g_context.preset_rename = g_context.new_preset_name;
+        g_context.preset_filter = {};
+        const auto matching = std::count_if(g_context.saved_presets.begin(), g_context.saved_presets.end(),
+            [](const SummonPreset& preset) {
+                return !g_context.presets_current_blueprint || preset.settings.class_path == g_context.class_path.data();
+            });
+        g_context.preset_page = (static_cast<std::size_t>(matching) - 1) / kPresetPageSize;
+        g_context.preset_message = localizer.Text("presets.added", "Preset added");
+        ConfigurationChangedLocked();
+    }
+    const bool selected = g_context.selected_preset < g_context.saved_presets.size();
+    if (selected) {
+        if (ui->same_line) ui->same_line(ui->user, 0, 10);
+        const auto replace = localizer.Text("presets.replace", "Update selected preset");
+        if (ActionButton(ui, replace.c_str(), valid &&
+                g_context.saved_presets[g_context.selected_preset].settings.class_path == g_context.class_path.data())) {
+            g_context.saved_presets[g_context.selected_preset] = {g_context.new_preset_name.data(), CaptureSettingsLocked()};
+            g_context.preset_rename = g_context.new_preset_name;
+            g_context.preset_message = localizer.Text("presets.updated", "Preset updated");
+            ConfigurationChangedLocked();
+        }
+    }
+    if (!g_context.preset_message.empty()) WrappedText(ui, g_context.preset_message);
+}
+
+void DrawPresetsTab(const AnomalyUiServiceV1* ui) {
+    const auto& localizer = g_context.localizer;
+    std::scoped_lock lock(g_context.mutex);
+    if (ui->input_text) {
+        const auto label = localizer.Text("presets.search", "Find preset");
+        if (ui->input_text(ui->user, anomaly::sdk::StringView(label),
+                g_context.preset_filter.data(), g_context.preset_filter.size(), 0))
+            g_context.preset_page = 0;
+    }
+    if (ui->checkbox) {
+        const auto label = localizer.Text("presets.current_blueprint", "Current blueprint only");
+        if (ui->checkbox(ui->user, anomaly::sdk::StringView(label), &g_context.presets_current_blueprint)) {
+            g_context.preset_page = 0;
+            ConfigurationChangedLocked();
+        }
+    }
+    std::vector<std::size_t> filtered;
+    for (std::size_t i = 0; i < g_context.saved_presets.size(); ++i) {
+        const auto& preset = g_context.saved_presets[i];
+        if (g_context.presets_current_blueprint && preset.settings.class_path != g_context.class_path.data()) continue;
+        const auto searchable = preset.name + "\n" + BlueprintLabel(preset.settings.class_path) + "\n" + preset.settings.class_path;
+        if (g_context.preset_filter[0] && !(ui->filter_match ?
+                ui->filter_match(ui->user, anomaly::sdk::StringView(g_context.preset_filter.data()), anomaly::sdk::StringView(searchable)) != 0 :
+                searchable.find(g_context.preset_filter.data()) != std::string::npos)) continue;
+        filtered.push_back(i);
+    }
+    const auto page_count = std::max<std::size_t>(1, (filtered.size() + kPresetPageSize - 1) / kPresetPageSize);
+    auto& page = g_context.preset_page;
+    page = std::min(page, page_count - 1);
+    const auto previous = localizer.Label("page.prev", "<", "preset-prev");
+    if (ActionButton(ui, previous.c_str(), page > 0)) --page;
+    if (ui->same_line) ui->same_line(ui->user, 0, 10);
+    const auto page_number = std::to_string(page + 1);
+    const auto pages = std::to_string(page_count);
+    const std::array<std::string_view, 2> page_args{page_number, pages};
+    ui->text(ui->user, anomaly::sdk::StringView(localizer.Format("page.indicator", "{0} / {1}", page_args)));
+    if (ui->same_line) ui->same_line(ui->user, 0, 10);
+    const auto next = localizer.Label("page.next", ">", "preset-next");
+    if (ActionButton(ui, next.c_str(), page + 1 < page_count)) ++page;
+    const auto first = page * kPresetPageSize;
+    const auto last = std::min(first + kPresetPageSize, filtered.size());
+    // Actions below the list always refer to a selection on the visible page.
+    if (std::find(filtered.begin() + first, filtered.begin() + last, g_context.selected_preset) == filtered.begin() + last)
+        g_context.selected_preset = summon_lab::kNoPreset;
+    const bool has_child = ui->begin_child && ui->end_child;
+    const bool visible = !has_child || ui->begin_child(ui->user,
+        anomaly::sdk::StringView("##summon-presets"), 0, 230, 0);
+    if (visible) {
+        for (std::size_t row = first; row < last; ++row) {
+            const auto i = filtered[row];
+            const auto& preset = g_context.saved_presets[i];
+            const auto label = std::string(g_context.selected_preset == i ? "> " : "") + preset.name + " | " +
+                BlueprintLabel(preset.settings.class_path) + "###summon-preset-" + std::to_string(i);
+            if (ActionButton(ui, label.c_str(), !g_context.preset_transfer, -1)) {
+                g_context.selected_preset = i;
+                std::snprintf(g_context.preset_rename.data(), g_context.preset_rename.size(), "%s", preset.name.c_str());
+                ApplySettingsLocked(preset.settings);
+                std::snprintf(g_context.new_preset_name.data(), g_context.new_preset_name.size(), "%s", preset.name.c_str());
+                g_context.preset_message = localizer.Text("presets.applied", "Preset applied");
+                ConfigurationChangedLocked();
+            }
+        }
+        if (filtered.empty()) WrappedText(ui, localizer.Text("presets.empty", "No matching presets"));
+    }
+    if (has_child) ui->end_child(ui->user);
+    const bool selected = g_context.selected_preset < g_context.saved_presets.size();
+    const bool editable = g_context.config_writable && !g_context.preset_transfer;
+    if (selected) {
+        if (ui->separator) ui->separator(ui->user);
+        if (ui->input_text) {
+            const auto label = localizer.Text("presets.rename_value", "New name");
+            ui->input_text(ui->user, anomaly::sdk::StringView(label), g_context.preset_rename.data(), g_context.preset_rename.size(), 0);
+        }
+        const auto rename = localizer.Text("presets.rename", "Rename");
+        if (ActionButton(ui, rename.c_str(), editable && summon_lab::ValidPresetName(g_context.preset_rename.data()))) {
+            g_context.saved_presets[g_context.selected_preset].name = g_context.preset_rename.data();
+            g_context.new_preset_name = g_context.preset_rename;
+            ConfigurationChangedLocked();
+        }
+        if (ui->same_line) ui->same_line(ui->user, 0, 10);
+        const auto remove = localizer.Text("presets.remove", "Delete preset");
+        if (ActionButton(ui, remove.c_str(), editable)) {
+            g_context.saved_presets.erase(g_context.saved_presets.begin() + g_context.selected_preset);
+            g_context.selected_preset = summon_lab::kNoPreset;
+            g_context.preset_message = localizer.Text("presets.removed", "Preset deleted");
+            ConfigurationChangedLocked();
+        }
+    }
+    if (ui->separator) ui->separator(ui->user);
+    ui->text(ui->user, anomaly::sdk::StringView(localizer.Text("presets.file_name", "File name")));
+    if (ui->same_line) ui->same_line(ui->user, 0, 6);
+    if (ui->input_text) {
+        if (ui->struct_size >= offsetof(AnomalyUiServiceV1, set_next_item_width) + sizeof(ui->set_next_item_width) &&
+                ui->set_next_item_width)
+            ui->set_next_item_width(ui->user, -368.0F);
+        if (ui->input_text(ui->user, anomaly::sdk::StringView("##preset-export-name"),
+                g_context.preset_export_name.data(), g_context.preset_export_name.size(), 0)) ConfigurationChangedLocked();
+    }
+    if (ui->same_line) ui->same_line(ui->user, 0, 6);
+    const auto choose_folder = localizer.Text("presets.choose_folder", "Choose folder");
+    if (ActionButton(ui, choose_folder.c_str(), !g_context.preset_transfer && !g_context.preset_picker.Busy(), 110))
+        OpenPresetPickerLocked(summon_lab::PresetFilePicker::Kind::Folder);
+    if (ui->same_line) ui->same_line(ui->user, 0, 6);
+    const bool can_export = !g_context.preset_transfer && !g_context.preset_picker.Busy() &&
+        !g_context.preset_export_folder.empty() && g_context.preset_export_name[0];
+    const auto export_selected = localizer.Text("presets.export_selected", "Export selected");
+    if (ActionButton(ui, export_selected.c_str(), can_export &&
+            g_context.selected_preset < g_context.saved_presets.size(), 130))
+        QueuePresetTransferLocked(false, false);
+    if (ui->same_line) ui->same_line(ui->user, 0, 6);
+    const auto export_all = localizer.Text("presets.export_all", "Export all");
+    if (ActionButton(ui, export_all.c_str(), can_export && !g_context.preset_transfer && !g_context.saved_presets.empty(), 110))
+        QueuePresetTransferLocked(false, true);
+    ui->text(ui->user, anomaly::sdk::StringView(localizer.Text("presets.import_file", "Import file")));
+    if (ui->same_line) ui->same_line(ui->user, 0, 6);
+    const auto choose_file = localizer.Text("presets.choose_file", "Choose file");
+    if (ActionButton(ui, choose_file.c_str(), !g_context.preset_transfer && !g_context.preset_picker.Busy(), 110))
+        OpenPresetPickerLocked(summon_lab::PresetFilePicker::Kind::ImportFile);
+    if (ui->same_line) ui->same_line(ui->user, 0, 6);
+    const auto import = localizer.Text("presets.import", "Import");
+    if (ActionButton(ui, import.c_str(), editable && !g_context.preset_transfer &&
+            !g_context.preset_picker.Busy() && !g_context.preset_import_file.empty())) QueuePresetTransferLocked(true, false);
+    if (!g_context.preset_import_file.empty()) {
+        if (ui->same_line) ui->same_line(ui->user, 0, 10);
+        const auto& file = g_context.preset_import_file;
+        const auto name = summon_lab::PathUtf8(std::filesystem::path(std::u8string(file.begin(), file.end())).filename());
+        ui->text(ui->user, anomaly::sdk::StringView(name));
+    }
+    if (!g_context.preset_message.empty()) WrappedText(ui, g_context.preset_message);
 }
 
 void DrawAggroEditor(const AnomalyUiServiceV1* ui, bool ready,
-                     const std::array<ManagementRecord, kMaxRecords>& records, std::size_t count,
+                     const std::vector<ManagementRecord>& records, std::size_t count,
                      const std::vector<std::uint64_t>& members, const summon_lab::BattleGraph& battles) {
     const auto& localizer = g_context.localizer;
     bool open{};
@@ -4696,9 +5958,11 @@ void DrawGroupActions(const AnomalyUiServiceV1* ui, bool ready,
 
 void DrawManagementTab(const AnomalyUiServiceV1* ui, bool ready) {
     const auto& localizer = g_context.localizer;
-    std::array<ManagementRecord, kMaxRecords> records{};
+    std::vector<ManagementRecord> records;
     std::vector<AttributeValue> attributes;
     std::string server_combat_source;
+    std::string editor_warning;
+    std::string editor_rule_warning;
     std::string blueprint;
     std::map<std::string, std::vector<std::uint64_t>> groups, combat_groups;
     std::size_t count{};
@@ -4709,7 +5973,8 @@ void DrawManagementTab(const AnomalyUiServiceV1* ui, bool ready) {
     const ManagementRecord* selected{};
     {
         std::scoped_lock lock(g_context.mutex);
-        count = g_context.record_count;
+        count = g_context.records.size();
+        records.resize(count);
         group_ready = ready && !SummonBusyLocked();
         page = g_context.management_page;
         blueprint = g_context.management_blueprint;
@@ -4731,6 +5996,8 @@ void DrawManagementTab(const AnomalyUiServiceV1* ui, bool ready) {
                 selected = &records[i];
                 attributes = source.attributes;
                 server_combat_source = source.server_combat_source;
+                editor_warning = source.editor_warning;
+                editor_rule_warning = source.editor_rule_warning;
             }
         }
     }
@@ -4744,6 +6011,8 @@ void DrawManagementTab(const AnomalyUiServiceV1* ui, bool ready) {
         selected = nullptr;
         attributes.clear();
         server_combat_source.clear();
+        editor_warning.clear();
+        editor_rule_warning.clear();
         std::scoped_lock lock(g_context.mutex);
         g_context.management_blueprint = path;
         g_context.management_page = 0;
@@ -4823,12 +6092,14 @@ void DrawManagementTab(const AnomalyUiServiceV1* ui, bool ready) {
                 selected = nullptr;
                 attributes.clear();
                 // Copy the selected entity's snapshot; no game reads happen in Draw.
-                for (std::size_t k = 0; k < g_context.record_count; ++k) {
+                for (std::size_t k = 0; k < g_context.records.size(); ++k) {
                     if (g_context.records[k].id != record.id) continue;
                     g_context.selected_record_id = record.id;
                     selected = &record;
                     attributes = g_context.records[k].attributes;
                     server_combat_source = g_context.records[k].server_combat_source;
+                    editor_warning = g_context.records[k].editor_warning;
+                    editor_rule_warning = g_context.records[k].editor_rule_warning;
                     break;
                 }
             }
@@ -4858,6 +6129,8 @@ void DrawManagementTab(const AnomalyUiServiceV1* ui, bool ready) {
         "manage.selected", "Manage entity #{0}", selected_args)));
     WrappedText(ui, selected->label.data());
     WrappedText(ui, BlueprintLabel(selected->class_path));
+    if (!editor_warning.empty()) WrappedText(ui, editor_warning);
+    if (!editor_rule_warning.empty()) WrappedText(ui, editor_rule_warning);
     if (!server_combat_source.empty()) {
         const std::array<std::string_view, 1> source_args{server_combat_source};
         WrappedText(ui, localizer.Format("summon.server_source", "Server combat: {0}", source_args));
@@ -4968,22 +6241,33 @@ void ANOMALY_CALL Draw(void* /*context*/, const AnomalyUiServiceV1* ui) {
     std::array<char, kTextCapacity> last_result{};
     {
         std::scoped_lock lock(g_context.mutex);
+        ConsumePresetPickerLocked();
         world_ready = g_context.session_world_ready;
         invoke_ready = g_context.has_invoke;
         failed = g_context.last_result_failed;
         last_result = g_context.last_result;
-        pending = static_cast<std::uint32_t>(g_context.pending_count);
+        pending = static_cast<std::uint32_t>(g_context.pending.size());
     }
     if (ui->begin_tab_bar(ui->user, anomaly::sdk::StringView("##summon-lab-tabs"),
                          ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_RESIZE_DOWN)) {
-        const auto blueprint = localizer.Label("tab.blueprint", "Blueprint", "blueprint");
+        const auto blueprint = localizer.Label("tab.blueprint", "Blueprints", "blueprint");
         if (ui->begin_tab_item(ui->user, anomaly::sdk::StringView(blueprint), nullptr, 0, 1)) {
             DrawBlueprintTab(ui);
             ui->end_tab_item(ui->user);
         }
         const auto settings = localizer.Label("tab.attributes", "Attributes", "attributes");
+        const auto presets = localizer.Label("tab.presets", "Presets", "presets");
+        if (ui->begin_tab_item(ui->user, anomaly::sdk::StringView(presets), nullptr, 0, 1)) {
+            DrawPresetsTab(ui);
+            ui->end_tab_item(ui->user);
+        }
         if (ui->begin_tab_item(ui->user, anomaly::sdk::StringView(settings), nullptr, 0, 1)) {
             DrawSettingsTab(ui);
+            ui->end_tab_item(ui->user);
+        }
+        const auto editor = localizer.Label("tab.editor", "Editor", "editor");
+        if (ui->begin_tab_item(ui->user, anomaly::sdk::StringView(editor), nullptr, 0, 1)) {
+            DrawBlueprintEditor(ui, world_ready && invoke_ready);
             ui->end_tab_item(ui->user);
         }
         const auto summon = localizer.Label("tab.summon", "Summon", "summon");
@@ -4999,6 +6283,10 @@ void ANOMALY_CALL Draw(void* /*context*/, const AnomalyUiServiceV1* ui) {
         ui->end_tab_bar(ui->user);
     }
     if (ui->separator != nullptr) ui->separator(ui->user);
+    {
+        std::scoped_lock lock(g_context.mutex);
+        if (!g_context.config_error.empty()) WrappedText(ui, g_context.config_error);
+    }
     ui->text(ui->user, anomaly::sdk::StringView(localizer.Text(
         world_ready ? "status.ready" : "status.not_ready", world_ready ? "World ready" : "World not ready")));
     if (pending != 0) {
@@ -5020,7 +6308,7 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
     if (descriptor == nullptr || descriptor->struct_size < sizeof(*descriptor))
         return {ANOMALY_STATUS_V1_INVALID_ARGUMENT, 0, {}};
     *descriptor = {sizeof(*descriptor), ANOMALY_PLUGIN_API_V1_MAJOR, ANOMALY_PLUGIN_API_V1_MINOR,
-                   anomaly::sdk::StringView("local.nte.summon-lab"),
+                   anomaly::sdk::StringView("anomaly.summon-lab"),
                    anomaly::sdk::StringView("Summon Lab"),
                    anomaly::sdk::StringView("Anomaly"), anomaly::sdk::StringView("1.0.0"),
                    Load, Start, Stop, Unload, Update, Draw};
